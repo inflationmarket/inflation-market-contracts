@@ -1,0 +1,39 @@
+{
+  "name": "inflation-market-contracts",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:coverage": "hardhat coverage",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "deploy": "hardhat deploy",
+    "deploy:sepolia": "hardhat deploy --network sepolia",
+    "node": "hardhat node",
+    "clean": "hardhat clean"
+  },
+  "keywords": [
+    "solidity",
+    "ethereum",
+    "smart-contracts",
+    "defi",
+    "derivatives",
+    "inflation"
+  ],
+  "author": "Inflation Market Team",
+  "license": "MIT",
+  "description": "Inflation Market - Decentralized perpetual futures for real-world inflation data",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "dotenv": "^17.2.3",
+    "hardhat": "^2.26.3",
+    "hardhat-deploy": "^1.0.4",
+    "hardhat-gas-reporter": "^2.3.0",
+    "solidity-coverage": "^0.8.16"
+  },
+  "dependencies": {
+    "@chainlink/contracts": "^0.8.0",
+    "@nomicfoundation/solidity-analyzer-win32-x64-msvc": "^0.1.2",
+    "@openzeppelin/contracts-upgradeable": "^5.4.0"
+  }
+}

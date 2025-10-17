@@ -1,0 +1,39 @@
+# Hardhat files
+cache
+artifacts
+typechain-types
+
+# Environment variables
+.env
+
+# Node
+node_modules
+package-lock.json
+yarn.lock
+
+# Coverage reports
+coverage
+coverage.json
+*.lcov
+
+# Gas reports
+gas-report.txt
+
+# Deployment files
+deployments/localhost
+deployments/hardhat
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+.vercel
