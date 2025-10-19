@@ -866,18 +866,51 @@ contract PositionManager is
     // ============================================================================
 
     /**
-     * @notice Calculate current P&L for a position
-     * @param positionId The ID of the position
-     * @return pnl Current profit or loss including funding payments
+     * @notice Calculate current unrealized P&L for an open position
+     * @dev This is a VIEW function - it does not modify state
+     *
+     * Calculation includes two components:
+     * 1. Price Change P&L: Profit/loss from price movement since entry
+     * 2. Funding Payments: Accumulated funding payments since entry
+     *
+     * Formula:
+     * - Price P&L = (currentPrice - entryPrice) / entryPrice * positionSize
+     * - For shorts, this is inverted: -(currentPrice - entryPrice) / entryPrice * positionSize
+     * - Total P&L = Price P&L - Funding Payments
+     *
+     * @param positionId The unique identifier of the position
+     * @return pnl The current unrealized profit (positive) or loss (negative) in USDC
+     *             Does NOT include trading fees which are deducted separately when closing
+     *
+     * Requirements:
+     * - Position must exist (size > 0)
+     *
+     * Reverts:
+     * - PositionNotFound: if position doesn't exist or was already closed
+     *
+     * Examples:
+     * - Long position: Entry $2000, Current $2200, 5x leverage, 1000 USDC collateral
+     *   Size = 5000 USDC, Price gain = 10%, P&L = 5000 * 10% = +500 USDC
+     * - Short position: Entry $2000, Current $2100, 3x leverage, 500 USDC collateral
+     *   Size = 1500 USDC, Price loss = 5%, P&L = 1500 * 5% = -75 USDC
+     *
+     * Usage:
+     * - Called by frontend to display unrealized P&L
+     * - Called internally by closePosition to calculate settlement
+     * - Called by liquidation bots to check position health
      */
     function calculatePnL(bytes32 positionId)
         public
         view
         returns (int256 pnl)
     {
+        // Verify position exists before calculating P&L
+        // A position with size == 0 either never existed or was already closed
         Position storage position = positions[positionId];
         if (position.size == 0) revert PositionNotFound();
 
+        // Delegate to internal function for actual calculation
+        // This allows code reuse by other functions without redundant checks
         return _calculatePnL(position);
     }
 
@@ -929,52 +962,239 @@ contract PositionManager is
     // ============================================================================
 
     /**
-     * @dev Calculate P&L for a position
+     * @dev Calculate unrealized P&L for a position (internal implementation)
+     *
+     * This function performs the core P&L calculation for perpetual positions.
+     * It combines two components:
+     *
+     * 1. PRICE CHANGE P&L
+     *    - Measures profit/loss from price movement
+     *    - Long positions profit when price increases
+     *    - Short positions profit when price decreases
+     *    - Amplified by leverage (position size)
+     *
+     * 2. FUNDING PAYMENTS
+     *    - Periodic payments between longs and shorts
+     *    - Keeps perpetual price anchored to index price
+     *    - Long pays short when mark > index (positive funding)
+     *    - Short pays long when mark < index (negative funding)
+     *
+     * @param position Storage pointer to the position struct
+     * @return pnl Net P&L (can be positive or negative)
+     *
+     * Mathematical Formula:
+     * ┌─────────────────────────────────────────────────────────────┐
+     * │ pricePnL = (currentPrice - entryPrice) * size / entryPrice │
+     * │ For shorts: pricePnL is inverted (multiplied by -1)        │
+     * │ totalPnL = pricePnL - fundingPayment                        │
+     * └─────────────────────────────────────────────────────────────┘
      */
     function _calculatePnL(Position storage position)
         internal
         view
         returns (int256 pnl)
     {
+        // ====================================================================
+        // STEP 1: GET CURRENT MARK PRICE
+        // ====================================================================
+
+        // Retrieve the current market price from vAMM
+        // This is constantly changing as traders open/close positions
+        // Price uses 1e18 precision (e.g., 2100e18 = $2100)
         uint256 currentPrice = vamm.getPrice();
 
-        // Calculate price change P&L
+        // ====================================================================
+        // STEP 2: CALCULATE PRICE DELTA
+        // ====================================================================
+
+        // Calculate the price change since position entry
+        // Can be positive (price increased) or negative (price decreased)
+        //
+        // Example 1: entryPrice = $2000, currentPrice = $2200
+        // priceDelta = +$200 (10% increase)
+        //
+        // Example 2: entryPrice = $2000, currentPrice = $1800
+        // priceDelta = -$200 (10% decrease)
         int256 priceDelta = int256(currentPrice) - int256(position.entryPrice);
+
+        // ====================================================================
+        // STEP 3: ADJUST FOR POSITION DIRECTION
+        // ====================================================================
+
+        // Long positions:
+        // - Profit when price increases (priceDelta > 0)
+        // - Loss when price decreases (priceDelta < 0)
+        // - Keep priceDelta as-is
+        //
+        // Short positions:
+        // - Profit when price decreases (priceDelta < 0, inverted to positive)
+        // - Loss when price increases (priceDelta > 0, inverted to negative)
+        // - Invert priceDelta (multiply by -1)
         if (!position.isLong) {
             priceDelta = -priceDelta;
         }
 
-        // P&L = (price change / entry price) * size * collateral
+        // ====================================================================
+        // STEP 4: CALCULATE PRICE CHANGE P&L
+        // ====================================================================
+
+        // Apply position size to calculate absolute P&L
+        //
+        // Formula: P&L = (price change / entry price) * position size
+        // This gives us the dollar value of profit or loss
+        //
+        // Example (Long position):
+        // - Entry: $2000, Current: $2200
+        // - Price delta: +$200
+        // - Position size: 5000 USDC (1000 collateral * 5x leverage)
+        // - P&L = ($200 / $2000) * 5000 = 0.10 * 5000 = +500 USDC
+        // - This is a 50% return on the 1000 USDC collateral
+        //
+        // Example (Short position):
+        // - Entry: $2000, Current: $2100
+        // - Price delta: +$100, inverted to -$100
+        // - Position size: 1500 USDC (500 collateral * 3x leverage)
+        // - P&L = (-$100 / $2000) * 1500 = -0.05 * 1500 = -75 USDC
+        // - This is a 15% loss on the 500 USDC collateral
         pnl = (priceDelta * int256(position.size)) / int256(position.entryPrice);
 
-        // Subtract funding payments
+        // ====================================================================
+        // STEP 5: SUBTRACT FUNDING PAYMENTS
+        // ====================================================================
+
+        // Calculate accumulated funding payments since position opened
+        // Funding payments are periodic transfers between longs and shorts
+        // that help keep the perpetual price close to the index price
+        //
+        // Funding payment calculation:
+        // - Positive funding rate: Longs pay shorts (mark price > index price)
+        // - Negative funding rate: Shorts pay longs (mark price < index price)
+        // - Payment amount proportional to position size and time held
         int256 fundingPayment = _calculateFundingPayment(position);
+
+        // Subtract funding payment from price P&L
+        // If funding payment is positive, trader owes payment (reduces P&L)
+        // If funding payment is negative, trader receives payment (increases P&L)
         pnl -= fundingPayment;
 
+        // ====================================================================
+        // STEP 6: RETURN FINAL P&L
+        // ====================================================================
+
+        // Return the net P&L combining price movement and funding
+        // Positive = profit, Negative = loss
+        // Note: This does NOT include trading fees, which are separate
         return pnl;
     }
 
     /**
-     * @dev Calculate funding payment for a position
+     * @dev Calculate accumulated funding payment for a position
+     *
+     * Funding payments are a core mechanism in perpetual futures that keep
+     * the perpetual contract price (mark price) anchored to the spot/index price.
+     *
+     * How Funding Works:
+     * ==================
+     * - When mark price > index price (perpetual trading at premium):
+     *   → Positive funding rate
+     *   → Long positions PAY shorts
+     *   → This incentivizes shorts, pushing mark price down
+     *
+     * - When mark price < index price (perpetual trading at discount):
+     *   → Negative funding rate
+     *   → Short positions PAY longs
+     *   → This incentivizes longs, pushing mark price up
+     *
+     * - Funding is paid continuously based on time position is held
+     * - Payment amount is proportional to position size
+     *
+     * @param position Storage pointer to the position struct
+     * @return payment Accumulated funding payment (positive = trader owes, negative = trader receives)
+     *
+     * Mathematical Formula:
+     * ┌──────────────────────────────────────────────────────────┐
+     * │ indexDelta = currentFundingIndex - entryFundingIndex    │
+     * │ payment = (positionSize * indexDelta) / PRECISION       │
+     * │ For shorts: payment is inverted (multiplied by -1)       │
+     * └──────────────────────────────────────────────────────────┘
+     *
+     * Examples:
+     * - Long position, positive funding (mark > index):
+     *   Payment is positive → trader pays (reduces P&L)
+     * - Short position, positive funding (mark > index):
+     *   Payment is negative → trader receives (increases P&L)
      */
     function _calculateFundingPayment(Position storage position)
         internal
         view
         returns (int256 payment)
     {
+        // ====================================================================
+        // STEP 1: GET CURRENT FUNDING INDEX
+        // ====================================================================
+
+        // Retrieve the current cumulative funding index
+        // This is a continuously growing value that tracks all funding payments
+        // over time, similar to how interest compounds
         uint256 currentIndex = _getCurrentFundingIndex();
+
+        // ====================================================================
+        // STEP 2: CALCULATE INDEX DELTA
+        // ====================================================================
+
+        // Calculate how much the funding index has changed since position entry
+        // This represents the cumulative funding rate accrued during position lifetime
+        //
+        // Example:
+        // - Entry funding index: 1000
+        // - Current funding index: 1050
+        // - Index delta: 50 (represents 5% cumulative funding)
         uint256 indexDelta = currentIndex > position.entryFundingIndex
             ? currentIndex - position.entryFundingIndex
-            : 0;
+            : 0; // Safety check: if current < entry, no payment
 
-        // Funding payment = size * index delta
+        // ====================================================================
+        // STEP 3: CALCULATE FUNDING PAYMENT AMOUNT
+        // ====================================================================
+
+        // Apply index delta to position size to get absolute payment amount
+        //
+        // Formula: payment = position size * (funding rate change)
+        //
+        // Example:
+        // - Position size: 5000 USDC
+        // - Index delta: 50 (from step 2)
+        // - Payment = 5000 * 50 / 1e18 = calculated payment in USDC
+        //
+        // Larger positions pay/receive proportionally more funding
         payment = int256((position.size * indexDelta) / PRECISION);
 
-        // Long pays short if funding rate is positive
+        // ====================================================================
+        // STEP 4: ADJUST FOR POSITION DIRECTION
+        // ====================================================================
+
+        // Long positions:
+        // - When funding is positive (mark > index): longs PAY
+        // - Payment is positive (reduces P&L)
+        // - Keep payment as-is
+        //
+        // Short positions:
+        // - When funding is positive (mark > index): shorts RECEIVE
+        // - Payment should be negative (increases P&L)
+        // - Invert payment (multiply by -1)
         if (!position.isLong) {
             payment = -payment;
         }
 
+        // ====================================================================
+        // STEP 5: RETURN FUNDING PAYMENT
+        // ====================================================================
+
+        // Return the calculated funding payment
+        // Positive value = trader owes payment (reduces final P&L)
+        // Negative value = trader receives payment (increases final P&L)
+        //
+        // This payment is subtracted from price P&L in _calculatePnL()
         return payment;
     }
 
