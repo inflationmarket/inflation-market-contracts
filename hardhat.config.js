@@ -1,4 +1,8 @@
 require("dotenv").config();
+require("@nomicfoundation/hardhat-toolbox");
+require("hardhat-deploy");
+require("hardhat-gas-reporter");
+require("solidity-coverage");
 
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL || "https://eth-sepolia.g.alchemy.com/v2/your-api-key";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -44,5 +48,16 @@ module.exports = {
 
   mocha: {
     timeout: 300000, // 5 minutes
+  },
+
+  gasReporter: {
+    enabled: process.env.REPORT_GAS === "true",
+    currency: "USD",
+    outputFile: "gas-report.txt",
+    noColors: true,
+  },
+
+  etherscan: {
+    apiKey: ETHERSCAN_API_KEY,
   },
 };
