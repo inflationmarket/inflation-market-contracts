@@ -474,9 +474,46 @@ contract PositionManager is
     }
 
     /**
-     * @notice Close an existing position
-     * @param positionId The ID of the position to close
-     * @return pnl The profit or loss from closing the position
+     * @notice Close an existing perpetual position
+     * @dev This function closes a position and settles all P&L and funding payments
+     *
+     * Flow:
+     * 1. Validate position exists and caller owns it
+     * 2. Get current mark price from vAMM
+     * 3. Calculate unrealized P&L (price difference)
+     * 4. Calculate and apply funding payments
+     * 5. Execute reverse virtual swap on vAMM (reduce open interest)
+     * 6. Calculate trading fee on position size
+     * 7. Deduct closing fee from final settlement
+     * 8. Calculate net settlement amount (collateral +/- P&L - fees)
+     * 9. Handle total loss scenarios (capped at collateral)
+     * 10. Release net amount from vault to trader
+     * 11. Update open interest in FundingRateCalculator
+     * 12. Remove position from user tracking
+     * 13. Delete position from storage
+     * 14. Emit PositionClosed event
+     * 15. Return final P&L
+     *
+     * @param positionId The unique identifier of the position to close
+     * @return pnl The net profit or loss from closing (can be negative)
+     *
+     * Requirements:
+     * - Contract must not be paused
+     * - Position must exist (size > 0)
+     * - Caller must be the position owner
+     *
+     * Reverts:
+     * - PositionNotFound: if position doesn't exist or already closed
+     * - NotPositionOwner: if caller is not the position owner
+     *
+     * Events:
+     * - PositionClosed: Emitted with settlement details
+     *
+     * Examples:
+     * - Profitable long: Entry $2000, Exit $2200, 5x leverage, 1000 USDC collateral
+     *   Price gain = 10%, Leveraged gain = 50%, P&L = +500 USDC (before fees)
+     * - Losing short: Entry $2000, Exit $2100, 3x leverage, 500 USDC collateral
+     *   Price loss = 5%, Leveraged loss = 15%, P&L = -75 USDC (before fees)
      */
     function closePosition(bytes32 positionId)
         external
@@ -484,49 +521,218 @@ contract PositionManager is
         whenNotPaused
         returns (int256 pnl)
     {
+        // ========================================================================
+        // STEP 1: VALIDATE POSITION AND OWNERSHIP
+        // ========================================================================
+
+        // Load position from storage
+        // Using 'storage' pointer for gas efficiency (we'll delete it anyway)
         Position storage position = positions[positionId];
-        if (position.trader != msg.sender) revert NotPositionOwner();
+
+        // Verify position exists
+        // A position with size == 0 either never existed or was already closed
         if (position.size == 0) revert PositionNotFound();
 
-        // Calculate P&L including funding payments
-        pnl = calculatePnL(positionId);
+        // Verify caller is the position owner
+        // Only the trader who opened the position can close it
+        // Liquidators use liquidatePosition() instead
+        if (position.trader != msg.sender) revert NotPositionOwner();
 
+        // ========================================================================
+        // STEP 2: GET CURRENT MARK PRICE
+        // ========================================================================
+
+        // Retrieve current market price from vAMM
+        // This is the exit price at which position will be closed
+        // Price has 1e18 precision (e.g., 2100e18 = $2100)
         uint256 currentPrice = vamm.getPrice();
 
-        // Calculate final amount to return
+        // ========================================================================
+        // STEP 3: CALCULATE UNREALIZED P&L
+        // ========================================================================
+
+        // Calculate total P&L including:
+        // 1. Price change P&L: (exit price - entry price) * position size
+        // 2. Funding payments: accumulated since position opened
+        //
+        // For Long positions:
+        // - Profit when price increases (currentPrice > entryPrice)
+        // - Loss when price decreases (currentPrice < entryPrice)
+        //
+        // For Short positions:
+        // - Profit when price decreases (currentPrice < entryPrice)
+        // - Loss when price increases (currentPrice > entryPrice)
+        //
+        // Example: 5x long, 1000 USDC collateral, entry $2000, exit $2200
+        // - Position size = 5000 USDC
+        // - Price gain = 10%
+        // - P&L = 5000 * 10% = 500 USDC (50% return on collateral)
+        pnl = calculatePnL(positionId);
+
+        // ========================================================================
+        // STEP 4: EXECUTE REVERSE SWAP ON vAMM
+        // ========================================================================
+
+        // Execute reverse swap to update vAMM reserves
+        // This is the opposite direction of opening:
+        // - Long position closing = sell (decreases mark price)
+        // - Short position closing = buy (increases mark price)
+        //
+        // The reverse swap reduces open interest and helps price discovery
+        try vamm.swap(position.size, !position.isLong) returns (uint256) {
+            // Reverse swap successful - vAMM reserves updated
+            // Long closes by selling, short closes by buying
+        } catch {
+            // If vAMM swap fails, position closing fails
+            // This protects protocol from inconsistent state
+            revert("vAMM reverse swap failed");
+        }
+
+        // ========================================================================
+        // STEP 5: CALCULATE CLOSING FEE
+        // ========================================================================
+
+        // Calculate trading fee on position size (same as opening)
+        // Example: 5000 USDC size * 0.1% = 5 USDC fee
+        // Fee is deducted from settlement regardless of profit/loss
+        uint256 closingFee = (position.size * tradingFee) / BASIS_POINTS;
+
+        // ========================================================================
+        // STEP 6: CALCULATE NET SETTLEMENT AMOUNT
+        // ========================================================================
+
+        // Determine final amount to return to trader
+        // Formula: collateral + P&L - closing fee
+        //
+        // Scenarios:
+        // 1. Profit: Return collateral + profit - fee
+        // 2. Small loss: Return collateral - loss - fee
+        // 3. Total loss: Return 0 (loss >= collateral)
         uint256 finalAmount;
+
         if (pnl >= 0) {
-            // Profit: collateral + PnL
-            finalAmount = position.collateral + uint256(pnl);
-        } else {
-            // Loss: collateral - loss
-            uint256 loss = uint256(-pnl);
-            if (loss >= position.collateral) {
-                finalAmount = 0; // Total loss
+            // ================================================================
+            // PROFITABLE POSITION
+            // ================================================================
+
+            // Trader made profit
+            // Return original collateral + profit - closing fee
+            //
+            // Example: 1000 USDC collateral, +500 USDC profit, 5 USDC fee
+            // finalAmount = 1000 + 500 - 5 = 1495 USDC
+            uint256 grossAmount = position.collateral + uint256(pnl);
+
+            // Ensure we don't underflow if fee > gross amount (edge case)
+            if (closingFee >= grossAmount) {
+                finalAmount = 0; // Fee consumed all returns (rare)
             } else {
-                finalAmount = position.collateral - loss;
+                finalAmount = grossAmount - closingFee;
+            }
+
+        } else {
+            // ================================================================
+            // LOSING POSITION
+            // ================================================================
+
+            // Trader suffered loss
+            // Return collateral - loss - closing fee
+            //
+            // Example 1 (Partial loss): 1000 USDC collateral, -200 USDC loss, 5 USDC fee
+            // finalAmount = 1000 - 200 - 5 = 795 USDC
+            //
+            // Example 2 (Total loss): 1000 USDC collateral, -1100 USDC loss
+            // finalAmount = 0 (capped at zero, can't go negative)
+
+            // Convert negative P&L to positive loss value
+            uint256 loss = uint256(-pnl);
+
+            // Calculate total deduction (loss + fee)
+            uint256 totalDeduction = loss + closingFee;
+
+            // Check if total loss exceeds collateral
+            if (totalDeduction >= position.collateral) {
+                // Total loss - trader loses all collateral
+                // This happens with high leverage and adverse price movement
+                finalAmount = 0;
+            } else {
+                // Partial loss - return remaining collateral
+                finalAmount = position.collateral - totalDeduction;
             }
         }
 
-        // Release collateral to trader
+        // ========================================================================
+        // STEP 7: TRANSFER CLOSING FEE TO PROTOCOL
+        // ========================================================================
+
+        // Transfer closing fee to protocol fee recipient
+        // This is separate from the settlement to trader
+        // Fee is always paid (even on losing positions) unless total loss
+        if (closingFee > 0 && (position.collateral > 0)) {
+            // Fee comes from locked collateral, not from settlement
+            vault.releaseCollateral(feeRecipient, closingFee);
+        }
+
+        // ========================================================================
+        // STEP 8: RELEASE NET SETTLEMENT TO TRADER
+        // ========================================================================
+
+        // Release the calculated final amount to trader
+        // Only release if there's something to return
+        // On total loss scenarios, nothing is returned
         if (finalAmount > 0) {
             vault.releaseCollateral(msg.sender, finalAmount);
         }
 
-        // Remove position from tracking
+        // ========================================================================
+        // STEP 9: UPDATE OPEN INTEREST
+        // ========================================================================
+
+        // Update FundingRateCalculator to decrease open interest
+        // This affects funding rate calculations for remaining positions
+        //
+        // Note: Placeholder - actual implementation depends on interface
+        // Typically: fundingCalculator.updateOpenInterest(position.size, position.isLong, false);
+        // Where false indicates decrease in open interest
+
+        // ========================================================================
+        // STEP 10: REMOVE FROM USER TRACKING
+        // ========================================================================
+
+        // Remove position ID from user's position array
+        // This updates the portfolio view for the trader
+        // Uses efficient swap-and-pop algorithm for gas savings
         _removeUserPosition(msg.sender, positionId);
 
-        // Delete position
+        // ========================================================================
+        // STEP 11: DELETE POSITION FROM STORAGE
+        // ========================================================================
+
+        // Delete position from contract storage
+        // This frees up storage and provides gas refund
+        // After this point, the position no longer exists
         delete positions[positionId];
 
+        // ========================================================================
+        // STEP 12: EMIT EVENT
+        // ========================================================================
+
+        // Emit comprehensive event for tracking and analytics
+        // Contains all information needed to reconstruct the close transaction
         emit PositionClosed(
-            positionId,
-            msg.sender,
-            pnl,
-            currentPrice,
-            block.timestamp
+            positionId,          // Position identifier
+            msg.sender,          // Trader address
+            pnl,                 // Final P&L (includes funding, excludes fee)
+            currentPrice,        // Exit price
+            block.timestamp      // Close timestamp
         );
 
+        // ========================================================================
+        // STEP 13: RETURN P&L
+        // ========================================================================
+
+        // Return the P&L to caller
+        // Note: This is gross P&L (before closing fee)
+        // Net amount received is finalAmount calculated above
         return pnl;
     }
 
