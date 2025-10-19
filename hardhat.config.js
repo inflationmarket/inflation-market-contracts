@@ -1,5 +1,7 @@
 require("dotenv").config();
-require("@nomicfoundation/hardhat-toolbox");
+require("@nomicfoundation/hardhat-ethers");
+require("@nomicfoundation/hardhat-chai-matchers");
+require("@nomicfoundation/hardhat-network-helpers");
 require("hardhat-deploy");
 require("hardhat-gas-reporter");
 require("solidity-coverage");
