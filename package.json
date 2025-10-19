@@ -25,12 +25,10 @@
   "description": "Inflation Market - Decentralized perpetual futures for real-world inflation data",
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
-    "@nomicfoundation/hardhat-ethers": "^4.0.2",
-    "@nomicfoundation/hardhat-network-helpers": "^3.0.1",
-    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
-    "@nomicfoundation/solidity-analyzer": "0.1.2",
-    "@nomicfoundation/solidity-analyzer-win32-x64-msvc": "^0.1.2",
-    "chai": "^6.2.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "chai": "^4.3.10",
     "dotenv": "^17.2.3",
     "ethers": "^6.15.0",
     "hardhat": "^2.26.3",
@@ -40,6 +38,8 @@
   },
   "dependencies": {
     "@chainlink/contracts": "^0.8.0",
-    "@openzeppelin/contracts-upgradeable": "^5.4.0"
+    "@openzeppelin/contracts": "^5.4.0",
+    "@openzeppelin/contracts-upgradeable": "^5.4.0",
+    "@openzeppelin/hardhat-upgrades": "^3.9.1"
   }
 }
