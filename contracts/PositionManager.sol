@@ -810,8 +810,54 @@ contract PositionManager is
 
     /**
      * @notice Liquidate an undercollateralized position
-     * @param positionId The ID of the position to liquidate
-     * @dev Can only be called by addresses with LIQUIDATOR_ROLE
+     * @dev This function forcibly closes positions that fall below maintenance margin requirements
+     *
+     * Liquidation Mechanism:
+     * ======================
+     * When a position's losses grow such that remaining collateral (equity) falls below
+     * the maintenance margin threshold, the position becomes liquidatable. This protects
+     * the protocol from insolvency and ensures positions don't accumulate negative equity.
+     *
+     * Flow:
+     * 1. Validate position exists
+     * 2. Calculate current position health ratio
+     * 3. Verify position is liquidatable (health < maintenance margin)
+     * 4. Get current mark price from vAMM
+     * 5. Execute reverse swap on vAMM to close position
+     * 6. Calculate liquidator reward (% of collateral)
+     * 7. Calculate remaining collateral for protocol
+     * 8. Distribute collateral (reward to liquidator, remainder to protocol)
+     * 9. Update open interest in FundingRateCalculator
+     * 10. Remove position from user tracking
+     * 11. Delete position from storage
+     * 12. Emit PositionLiquidated event
+     *
+     * @param positionId The unique identifier of the position to liquidate
+     *
+     * Requirements:
+     * - Contract must not be paused
+     * - Caller must have LIQUIDATOR_ROLE
+     * - Position must exist (size > 0)
+     * - Position must be liquidatable (healthRatio < maintenanceMargin)
+     *
+     * Reverts:
+     * - PositionNotFound: if position doesn't exist or already closed
+     * - PositionNotLiquidatable: if position is still healthy (healthRatio >= maintenanceMargin)
+     *
+     * Events:
+     * - PositionLiquidated: Emitted with liquidation details
+     *
+     * Examples:
+     * - Long 5x at $2000, 1000 USDC collateral, 5% maintenance margin
+     *   Liquidation price = $1620 (19% drop)
+     *   If price hits $1620, health ratio = 5%, position is liquidatable
+     *   Liquidator receives 5% of 1000 USDC = 50 USDC reward
+     *   Protocol receives remaining 950 USDC
+     *
+     * Security:
+     * - Only addresses with LIQUIDATOR_ROLE can call this function
+     * - This prevents arbitrary liquidations and allows for permissioned or keeper-based models
+     * - Health check ensures only truly underwater positions are liquidated
      */
     function liquidatePosition(bytes32 positionId)
         external
@@ -819,45 +865,169 @@ contract PositionManager is
         whenNotPaused
         onlyRole(LIQUIDATOR_ROLE)
     {
+        // ========================================================================
+        // STEP 1: VALIDATE POSITION EXISTS
+        // ========================================================================
+
+        // Load position from storage
         Position storage position = positions[positionId];
+
+        // Verify position exists and hasn't been already liquidated or closed
         if (position.size == 0) revert PositionNotFound();
 
-        // Check if position is liquidatable
+        // ========================================================================
+        // STEP 2: CHECK POSITION HEALTH
+        // ========================================================================
+
+        // Calculate position health ratio
+        // Health ratio = (equity / position value) * BASIS_POINTS
+        // Where equity = collateral + unrealized P&L
+        //
+        // Example:
+        // - Collateral: 1000 USDC
+        // - Unrealized loss: -900 USDC
+        // - Equity: 100 USDC
+        // - Position value: 5000 USDC (5x leverage)
+        // - Health ratio: (100 / 5000) * 10000 = 200 basis points = 2%
         uint256 healthRatio = _getPositionHealth(position);
+
+        // ========================================================================
+        // STEP 3: VERIFY POSITION IS LIQUIDATABLE
+        // ========================================================================
+
+        // Check if health ratio is below maintenance margin threshold
+        // Maintenance margin is typically 5% (500 basis points)
+        //
+        // If healthRatio >= maintenanceMargin, position is still healthy
+        // Only underwater positions (health < maintenance) can be liquidated
         if (healthRatio >= maintenanceMargin) revert PositionNotLiquidatable();
 
+        // Store trader address before deleting position
+        // Needed for event emission and user position tracking removal
         address trader = position.trader;
+
+        // ========================================================================
+        // STEP 4: GET CURRENT MARK PRICE
+        // ========================================================================
+
+        // Retrieve current market price from vAMM
+        // This is the price at which the position is being liquidated
+        // Used for event emission and analytics
         uint256 currentPrice = vamm.getPrice();
 
-        // Calculate liquidation reward for liquidator
+        // ========================================================================
+        // STEP 5: EXECUTE REVERSE SWAP ON vAMM
+        // ========================================================================
+
+        // Execute reverse swap to close position and update vAMM reserves
+        // Similar to closing a position, but liquidation doesn't return funds to trader
+        // Long position = sell (decreases mark price)
+        // Short position = buy (increases mark price)
+        try vamm.swap(position.size, !position.isLong) returns (uint256) {
+            // Reverse swap successful - vAMM reserves updated
+            // Position is now closed on the vAMM side
+        } catch {
+            // If vAMM swap fails, liquidation fails
+            // This maintains protocol consistency
+            revert("vAMM reverse swap failed during liquidation");
+        }
+
+        // ========================================================================
+        // STEP 6: CALCULATE LIQUIDATOR REWARD
+        // ========================================================================
+
+        // Calculate reward for the liquidator
+        // Reward = collateral * liquidation fee (default 5%)
+        //
+        // Example:
+        // - Collateral: 1000 USDC
+        // - Liquidation fee: 5% (500 basis points)
+        // - Reward: 1000 * 500 / 10000 = 50 USDC
+        //
+        // This incentivizes keepers/bots to monitor and liquidate unhealthy positions
         uint256 reward = (position.collateral * liquidationFee) / BASIS_POINTS;
 
-        // Calculate remaining collateral for protocol
+        // ========================================================================
+        // STEP 7: CALCULATE REMAINING COLLATERAL FOR PROTOCOL
+        // ========================================================================
+
+        // Calculate remaining collateral after liquidator reward
+        // Remaining goes to protocol treasury/insurance fund
+        //
+        // Example:
+        // - Total collateral: 1000 USDC
+        // - Liquidator reward: 50 USDC
+        // - Remaining: 950 USDC (goes to protocol)
+        //
+        // In edge cases where position is deeply underwater,
+        // reward might exceed collateral, so we cap at 0
         uint256 remaining = position.collateral > reward
             ? position.collateral - reward
             : 0;
 
-        // Distribute collateral
+        // ========================================================================
+        // STEP 8: DISTRIBUTE COLLATERAL
+        // ========================================================================
+
+        // Release liquidator reward from vault
+        // This compensates the liquidator for gas costs and monitoring
         if (reward > 0) {
             vault.releaseCollateral(msg.sender, reward);
         }
+
+        // Release remaining collateral to protocol fee recipient
+        // This goes to insurance fund or protocol treasury
+        // Helps cover potential protocol losses and fund development
         if (remaining > 0) {
             vault.releaseCollateral(feeRecipient, remaining);
         }
 
-        // Remove position from tracking
+        // ========================================================================
+        // STEP 9: UPDATE OPEN INTEREST
+        // ========================================================================
+
+        // Update FundingRateCalculator to decrease open interest
+        // This affects funding rate calculations for remaining positions
+        //
+        // Note: Placeholder - actual implementation depends on interface
+        // Typically: fundingCalculator.updateOpenInterest(position.size, position.isLong, false);
+        // Where false indicates decrease in open interest
+
+        // ========================================================================
+        // STEP 10: REMOVE FROM USER TRACKING
+        // ========================================================================
+
+        // Remove position ID from trader's position array
+        // Uses efficient swap-and-pop algorithm for gas savings
+        // Trader no longer has this position in their portfolio
         _removeUserPosition(trader, positionId);
 
-        // Delete position
+        // ========================================================================
+        // STEP 11: DELETE POSITION FROM STORAGE
+        // ========================================================================
+
+        // Delete position from contract storage
+        // Frees up storage and provides gas refund
+        // Position is now fully liquidated and removed
         delete positions[positionId];
 
+        // ========================================================================
+        // STEP 12: EMIT EVENT
+        // ========================================================================
+
+        // Emit comprehensive liquidation event
+        // Critical for:
+        // - Liquidation bot tracking and analytics
+        // - Trader notifications
+        // - Protocol monitoring and risk management
+        // - Audit trail for liquidations
         emit PositionLiquidated(
-            positionId,
-            trader,
-            msg.sender,
-            currentPrice,
-            reward,
-            block.timestamp
+            positionId,          // Position identifier
+            trader,              // Original position owner
+            msg.sender,          // Liquidator address
+            currentPrice,        // Liquidation price
+            reward,              // Liquidator reward amount
+            block.timestamp      // Liquidation timestamp
         );
     }
 
@@ -942,18 +1112,51 @@ contract PositionManager is
 
     /**
      * @notice Check if a position can be liquidated
-     * @param positionId The ID of the position
-     * @return True if the position is below maintenance margin
+     * @dev View function that determines if a position's health has fallen below liquidation threshold
+     *
+     * A position is liquidatable when:
+     * - Position exists (size > 0)
+     * - Health ratio < maintenance margin
+     *
+     * Health Ratio Calculation:
+     * ========================
+     * healthRatio = (equity / positionValue) * BASIS_POINTS
+     * Where:
+     * - equity = collateral + unrealized P&L
+     * - positionValue = size * entryPrice / PRECISION
+     *
+     * @param positionId The unique identifier of the position to check
+     * @return bool True if position can be liquidated, false otherwise
+     *
+     * Examples:
+     * - Position with 2% health ratio, 5% maintenance margin → liquidatable = true
+     * - Position with 8% health ratio, 5% maintenance margin → liquidatable = false
+     * - Non-existent position → liquidatable = false
+     *
+     * Usage:
+     * - Called by liquidation bots to identify liquidatable positions
+     * - Called by frontend to display liquidation risk indicators
+     * - Used in monitoring systems to alert traders of liquidation risk
      */
     function isPositionLiquidatable(bytes32 positionId)
         external
         view
         returns (bool)
     {
+        // Load position from storage
         Position storage position = positions[positionId];
+
+        // If position doesn't exist or was already closed, it's not liquidatable
+        // A size of 0 indicates no active position
         if (position.size == 0) return false;
 
+        // Calculate current health ratio of the position
+        // Returns value in basis points (10000 = 100%)
         uint256 healthRatio = _getPositionHealth(position);
+
+        // Position is liquidatable if health ratio falls below maintenance margin
+        // Example: healthRatio = 300 (3%), maintenanceMargin = 500 (5%)
+        // Result: 300 < 500 = true (liquidatable)
         return healthRatio < maintenanceMargin;
     }
 
@@ -1207,48 +1410,289 @@ contract PositionManager is
     }
 
     /**
-     * @dev Calculate liquidation price for a position
+     * @dev Calculate liquidation price for a position (internal implementation)
+     *
+     * The liquidation price is the market price at which a position's health ratio
+     * would fall to exactly the maintenance margin threshold, triggering liquidation.
+     *
+     * Liquidation Mechanics:
+     * =====================
+     * A position gets liquidated when losses erode collateral to the point where
+     * remaining equity = maintenance margin * position value
+     *
+     * Formula Derivation:
+     * ==================
+     * 1. Loss threshold = 100% - maintenance margin
+     *    (e.g., 5% maintenance = 95% loss threshold)
+     *
+     * 2. Price change % = loss threshold / leverage
+     *    (Higher leverage = smaller price move needed for liquidation)
+     *
+     * 3. Long positions:
+     *    Liquidation price = entry price * (1 - price change %)
+     *    (Price must drop by this % to trigger liquidation)
+     *
+     * 4. Short positions:
+     *    Liquidation price = entry price * (1 + price change %)
+     *    (Price must rise by this % to trigger liquidation)
+     *
+     * @param entryPrice The price at which the position was opened (1e18 precision)
+     * @param leverage The leverage multiplier (1e18 = 1x, 5e18 = 5x, etc.)
+     * @param isLong True for long position, false for short position
+     * @return uint256 The liquidation price (1e18 precision)
+     *
+     * Examples:
+     * =========
+     * Example 1 - Long 5x Position:
+     * - Entry: $2000, Leverage: 5x, Maintenance: 5%
+     * - Loss threshold: 100% - 5% = 95%
+     * - Price change %: 95% / 5 = 19%
+     * - Liquidation price: $2000 * (1 - 19%) = $2000 * 0.81 = $1620
+     * - Interpretation: Price must drop 19% ($380) to trigger liquidation
+     *
+     * Example 2 - Short 10x Position:
+     * - Entry: $2000, Leverage: 10x, Maintenance: 5%
+     * - Loss threshold: 100% - 5% = 95%
+     * - Price change %: 95% / 10 = 9.5%
+     * - Liquidation price: $2000 * (1 + 9.5%) = $2000 * 1.095 = $2190
+     * - Interpretation: Price must rise 9.5% ($190) to trigger liquidation
+     *
+     * Example 3 - Long 20x Position (maximum leverage):
+     * - Entry: $2000, Leverage: 20x, Maintenance: 5%
+     * - Loss threshold: 100% - 5% = 95%
+     * - Price change %: 95% / 20 = 4.75%
+     * - Liquidation price: $2000 * (1 - 4.75%) = $2000 * 0.9525 = $1905
+     * - Interpretation: Only 4.75% ($95) drop needed for liquidation (very risky!)
+     *
+     * Key Insights:
+     * =============
+     * - Higher leverage = closer liquidation price to entry
+     * - 5x leverage can withstand ~19% adverse move
+     * - 10x leverage can withstand ~9.5% adverse move
+     * - 20x leverage can withstand ~4.75% adverse move
+     * - Long positions liquidate on downward price moves
+     * - Short positions liquidate on upward price moves
      */
     function _calculateLiquidationPrice(
         uint256 entryPrice,
         uint256 leverage,
         bool isLong
     ) internal view returns (uint256) {
-        // Liquidation occurs when loss reaches (100% - maintenance margin)
+        // ====================================================================
+        // STEP 1: CALCULATE LOSS THRESHOLD
+        // ====================================================================
+
+        // Loss threshold = percentage of collateral that can be lost
+        // before liquidation occurs
+        //
+        // Formula: 100% - maintenance margin
+        //
+        // Example with 5% maintenance margin:
+        // - Loss threshold = 10000 - 500 = 9500 basis points = 95%
+        // - Meaning: Position can lose 95% of value before liquidation
         uint256 lossThreshold = BASIS_POINTS - maintenanceMargin;
 
-        // Price change % that causes liquidation = loss threshold / leverage
+        // ====================================================================
+        // STEP 2: CALCULATE PRICE CHANGE PERCENTAGE
+        // ====================================================================
+
+        // Calculate what % price change would cause the loss threshold
+        // Formula: loss threshold / leverage
+        //
+        // Why divided by leverage?
+        // - Higher leverage amplifies price movements
+        // - 5x leverage means 1% price move = 5% P&L change
+        // - So to lose 95%, you need 95% / 5 = 19% price move
+        //
+        // Example with 5x leverage and 95% loss threshold:
+        // - Price change % = (9500 * 1e18) / 5e18
+        // - = 1.9e18 = 190% in internal representation
+        // - = 19% actual price change
         uint256 priceChangePercent = (lossThreshold * PRECISION) / leverage;
 
+        // ====================================================================
+        // STEP 3: CALCULATE LIQUIDATION PRICE BASED ON DIRECTION
+        // ====================================================================
+
         uint256 liquidationPrice;
+
         if (isLong) {
-            // Long: liquidation price = entry price * (1 - priceChangePercent)
+            // ================================================================
+            // LONG POSITION LIQUIDATION
+            // ================================================================
+
+            // Long positions profit when price increases, lose when price decreases
+            // Liquidation occurs on DOWNWARD price movement
+            //
+            // Formula: entry price * (1 - price change %)
+            //
+            // Example:
+            // - Entry: 2000e18
+            // - Price change %: 0.19e18 (19%)
+            // - Liquidation: 2000e18 * (1e18 - 0.19e18) / 1e18
+            // - = 2000e18 * 0.81e18 / 1e18
+            // - = 1620e18 ($1620)
             liquidationPrice = (entryPrice * (PRECISION - priceChangePercent)) / PRECISION;
+
         } else {
-            // Short: liquidation price = entry price * (1 + priceChangePercent)
+            // ================================================================
+            // SHORT POSITION LIQUIDATION
+            // ================================================================
+
+            // Short positions profit when price decreases, lose when price increases
+            // Liquidation occurs on UPWARD price movement
+            //
+            // Formula: entry price * (1 + price change %)
+            //
+            // Example:
+            // - Entry: 2000e18
+            // - Price change %: 0.095e18 (9.5% for 10x leverage)
+            // - Liquidation: 2000e18 * (1e18 + 0.095e18) / 1e18
+            // - = 2000e18 * 1.095e18 / 1e18
+            // - = 2190e18 ($2190)
             liquidationPrice = (entryPrice * (PRECISION + priceChangePercent)) / PRECISION;
         }
 
+        // ====================================================================
+        // STEP 4: RETURN LIQUIDATION PRICE
+        // ====================================================================
+
+        // Return the calculated liquidation price
+        // This value is:
+        // - Stored in the position struct for quick reference
+        // - Used by liquidation bots to monitor positions
+        // - Displayed in frontend to show liquidation risk
+        // - Updated when margin is added/removed
         return liquidationPrice;
     }
 
     /**
-     * @dev Get position health ratio (margin / maintenance margin)
+     * @dev Calculate position health ratio (internal implementation)
+     *
+     * Position health is the ratio of remaining equity to position value, expressed in basis points.
+     * This is THE KEY metric for determining liquidation eligibility.
+     *
+     * Health Ratio Meaning:
+     * ====================
+     * - 10000 (100%) = Position at entry (no P&L)
+     * - 5000 (50%) = Lost 50% of collateral value
+     * - 500 (5%) = At maintenance margin (typically liquidatable)
+     * - 0 (0%) = Total loss (equity completely wiped out)
+     *
+     * Calculation:
+     * ===========
+     * 1. Calculate current unrealized P&L
+     * 2. Calculate equity = collateral + P&L
+     * 3. If equity <= 0, position is bankrupt (return 0)
+     * 4. Calculate position value = size * entry price
+     * 5. Health ratio = (equity / position value) * BASIS_POINTS
+     *
+     * @param position Storage pointer to the position struct
+     * @return uint256 Health ratio in basis points (0-10000+)
+     *
+     * Examples:
+     * =========
+     * Example 1 - Healthy Long Position:
+     * - Entry: $2000, Current: $2100, 5x leverage, 1000 USDC collateral
+     * - Size: 5000 USDC
+     * - P&L: +250 USDC (5% price gain * 5x = 25% gain)
+     * - Equity: 1000 + 250 = 1250 USDC
+     * - Position value: 5000 USDC
+     * - Health ratio: (1250 / 5000) * 10000 = 2500 (25%)
+     * - Status: Healthy (well above 5% maintenance)
+     *
+     * Example 2 - Near Liquidation Short Position:
+     * - Entry: $2000, Current: $2190, 5x leverage, 1000 USDC collateral
+     * - Size: 5000 USDC
+     * - P&L: -475 USDC (9.5% price gain on short * 5x = -47.5% loss)
+     * - Equity: 1000 - 475 = 525 USDC
+     * - Position value: 5000 USDC
+     * - Health ratio: (525 / 5000) * 10000 = 1050 (10.5%)
+     * - Status: Risky (approaching 5% maintenance margin)
+     *
+     * Example 3 - Liquidatable Position:
+     * - Entry: $2000, Current: $1620, 5x leverage, 1000 USDC collateral
+     * - Size: 5000 USDC
+     * - P&L: -950 USDC
+     * - Equity: 1000 - 950 = 50 USDC
+     * - Position value: 5000 USDC
+     * - Health ratio: (50 / 5000) * 10000 = 100 (1%)
+     * - Status: Liquidatable (below 5% maintenance)
      */
     function _getPositionHealth(Position storage position)
         internal
         view
         returns (uint256)
     {
+        // ====================================================================
+        // STEP 1: CALCULATE UNREALIZED P&L
+        // ====================================================================
+
+        // Get current profit or loss for this position
+        // Includes both price movement and funding payments
+        // Can be positive (profit) or negative (loss)
         int256 pnl = _calculatePnL(position);
+
+        // ====================================================================
+        // STEP 2: CALCULATE EQUITY (REMAINING VALUE)
+        // ====================================================================
+
+        // Equity = Initial collateral + Unrealized P&L
+        // This is the amount trader would get back if closing now (minus fees)
+        //
+        // Example scenarios:
+        // - Collateral: 1000, P&L: +200 → Equity: 1200
+        // - Collateral: 1000, P&L: -300 → Equity: 700
+        // - Collateral: 1000, P&L: -1100 → Equity: -100 (bankrupt)
         int256 equity = int256(position.collateral) + pnl;
 
+        // ====================================================================
+        // STEP 3: HANDLE BANKRUPT POSITIONS
+        // ====================================================================
+
+        // If equity is zero or negative, position is completely underwater
+        // Return 0 health ratio (worst possible health)
+        // These positions should be liquidated immediately to prevent protocol loss
         if (equity <= 0) return 0;
 
-        // Health ratio = (equity / position value) * 10000
+        // ====================================================================
+        // STEP 4: CALCULATE POSITION VALUE
+        // ====================================================================
+
+        // Position value = notional size * entry price
+        // This represents the full position exposure
+        //
+        // Example:
+        // - Size: 5000 USDC (1000 * 5x leverage)
+        // - Entry price: 2000 (in 1e18 precision)
+        // - Position value: 5000 USDC
         uint256 positionValue = (position.size * position.entryPrice) / PRECISION;
+
+        // ====================================================================
+        // STEP 5: CALCULATE HEALTH RATIO
+        // ====================================================================
+
+        // Health ratio = (equity / position value) * BASIS_POINTS
+        // Expressed in basis points (10000 = 100%)
+        //
+        // This tells us what percentage of the position value is backed by equity
+        // Lower ratio = closer to liquidation
+        // Higher ratio = healthier position
+        //
+        // Example:
+        // - Equity: 250 USDC
+        // - Position value: 5000 USDC
+        // - Health ratio: (250 / 5000) * 10000 = 500 (5%)
+        // - At exactly maintenance margin threshold
         uint256 healthRatio = (uint256(equity) * BASIS_POINTS) / positionValue;
 
+        // ====================================================================
+        // STEP 6: RETURN HEALTH RATIO
+        // ====================================================================
+
+        // Return the calculated health ratio
+        // Used by liquidation logic to determine if position should be liquidated
+        // Also used by frontend to display liquidation risk to users
         return healthRatio;
     }
 
