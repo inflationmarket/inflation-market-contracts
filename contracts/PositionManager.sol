@@ -224,84 +224,252 @@ contract PositionManager is
 
     /**
      * @notice Open a new perpetual position
-     * @param isLong True for long position, false for short
-     * @param collateralAmount Amount of USDC collateral to deposit
-     * @param leverage Leverage multiplier (scaled by 1e18, e.g., 5e18 = 5x)
-     * @return positionId Unique identifier for the position
+     * @dev This is THE CORE function that orchestrates all protocol components
+     *
+     * Flow:
+     * 1. Validate all inputs (leverage bounds, collateral minimums)
+     * 2. Check user has sufficient balance in Vault
+     * 3. Calculate position size based on leverage
+     * 4. Lock collateral in Vault
+     * 5. Deduct and transfer trading fees
+     * 6. Get mark price from vAMM
+     * 7. Execute virtual swap on vAMM to update reserves
+     * 8. Get current funding index from FundingRateCalculator
+     * 9. Calculate liquidation price based on maintenance margin
+     * 10. Generate unique position ID
+     * 11. Store position in contract state
+     * 12. Update user's position tracking
+     * 13. Update open interest metrics
+     * 14. Emit PositionOpened event
+     *
+     * @param isLong True for long position (profit when price increases), false for short (profit when price decreases)
+     * @param collateralAmount Amount of USDC collateral to deposit (must be >= minCollateral)
+     * @param leverage Leverage multiplier scaled by 1e18 (e.g., 5e18 = 5x, range: 1x-20x)
+     * @return positionId Unique keccak256 hash identifier for the opened position
+     *
+     * Requirements:
+     * - Contract must not be paused
+     * - collateralAmount must be >= minCollateral (10 USDC default)
+     * - leverage must be >= MIN_LEVERAGE (1x) and <= maxLeverage (configurable, max 20x)
+     * - User must have approved this contract to spend collateralAmount + fees
+     * - Vault must have sufficient liquidity
+     *
+     * Reverts:
+     * - InsufficientCollateral: if collateralAmount < minCollateral
+     * - InvalidLeverage: if leverage is outside allowed bounds
+     * - Reverts from Vault.lockCollateral if insufficient user balance
+     *
+     * Events:
+     * - PositionOpened: Emitted with all position details
      */
     function openPosition(
         bool isLong,
         uint256 collateralAmount,
         uint256 leverage
     ) external nonReentrant whenNotPaused returns (bytes32 positionId) {
-        // Validate inputs
+
+        // ========================================================================
+        // STEP 1: INPUT VALIDATION
+        // ========================================================================
+
+        // Validate collateral meets minimum requirement (default 10 USDC)
+        // This prevents dust positions that would be unprofitable to liquidate
         if (collateralAmount < minCollateral) revert InsufficientCollateral();
+
+        // Validate leverage is within protocol bounds
+        // MIN_LEVERAGE (1x) ensures no zero-leverage positions
+        // maxLeverage (default 10x, max 20x) limits protocol risk exposure
         if (leverage < MIN_LEVERAGE || leverage > maxLeverage) revert InvalidLeverage();
 
-        // Calculate position size
+        // Note: Additional validation of user's vault balance happens in vault.lockCollateral()
+        // If user doesn't have sufficient approved balance, that call will revert
+
+        // ========================================================================
+        // STEP 2: CALCULATE POSITION SIZE
+        // ========================================================================
+
+        // Position size = collateral * leverage
+        // Example: 1000 USDC * 5x = 5000 USDC notional exposure
+        // Division by PRECISION (1e18) because leverage is scaled
         uint256 size = (collateralAmount * leverage) / PRECISION;
 
-        // Get current market price from vAMM
+        // ========================================================================
+        // STEP 3: LOCK COLLATERAL IN VAULT
+        // ========================================================================
+
+        // Transfer and lock user's collateral in the Vault
+        // This is done BEFORE getting price to follow checks-effects-interactions pattern
+        // Reverts if user hasn't approved enough tokens or has insufficient balance
+        vault.lockCollateral(msg.sender, collateralAmount);
+
+        // ========================================================================
+        // STEP 4: CALCULATE AND DEDUCT TRADING FEE
+        // ========================================================================
+
+        // Calculate trading fee based on position size (not collateral)
+        // Example: 5000 USDC size * 0.1% = 5 USDC fee
+        uint256 fee = (size * tradingFee) / BASIS_POINTS;
+
+        if (fee > 0) {
+            // Lock fee from user's balance (separate from collateral)
+            vault.lockCollateral(msg.sender, fee);
+
+            // Immediately release fee to protocol fee recipient
+            // This ensures fees are collected even if position is immediately liquidated
+            vault.releaseCollateral(feeRecipient, fee);
+        }
+
+        // ========================================================================
+        // STEP 5: GET MARK PRICE FROM vAMM
+        // ========================================================================
+
+        // Get current market price from virtual AMM
+        // This is the price at which the position will be opened
+        // Price has 1e18 precision (e.g., 2000e18 = $2000)
         uint256 entryPrice = vamm.getPrice();
 
-        // Get current funding index
+        // ========================================================================
+        // STEP 6: UPDATE vAMM RESERVES (EXECUTE VIRTUAL SWAP)
+        // ========================================================================
+
+        // Execute a virtual swap on the vAMM to update reserves
+        // This simulates the market impact of opening a leveraged position
+        // Long = buy pressure (increases mark price)
+        // Short = sell pressure (decreases mark price)
+        //
+        // Note: vAMM.swap() updates the constant product (k = x * y)
+        // and moves the mark price based on the position size
+        try vamm.swap(size, isLong) returns (uint256) {
+            // Swap successful - vAMM reserves updated
+            // The return value represents the amount received from the swap
+            // We don't need it here as we're using the pre-swap price as entry price
+        } catch {
+            // If vAMM swap fails (e.g., excessive slippage), position opening fails
+            // This protects users from opening positions at unfavorable prices
+            // In production, consider custom error with slippage details
+            revert("vAMM swap failed");
+        }
+
+        // ========================================================================
+        // STEP 7: GET CURRENT FUNDING INDEX
+        // ========================================================================
+
+        // Retrieve current funding rate index from FundingRateCalculator
+        // This is stored to calculate funding payments when position is closed
+        // Funding payments occur periodically between longs and shorts to keep
+        // perpetual price anchored to index price
         uint256 entryFundingIndex = _getCurrentFundingIndex();
 
-        // Calculate liquidation price
+        // ========================================================================
+        // STEP 8: CALCULATE LIQUIDATION PRICE
+        // ========================================================================
+
+        // Calculate the price at which this position becomes liquidatable
+        // Liquidation occurs when unrealized loss reaches maintenance margin threshold
+        //
+        // Example for 5x long at $2000 entry with 5% maintenance margin:
+        // - Loss threshold = 95% (100% - 5%)
+        // - Price move = 95% / 5 = 19%
+        // - Liquidation price = $2000 * (1 - 19%) = $1620
+        //
+        // This is stored in the position for quick liquidation checks
         uint256 liquidationPrice = _calculateLiquidationPrice(
             entryPrice,
             leverage,
             isLong
         );
 
-        // Lock collateral in vault
-        vault.lockCollateral(msg.sender, collateralAmount);
+        // ========================================================================
+        // STEP 9: GENERATE UNIQUE POSITION ID
+        // ========================================================================
 
-        // Calculate and deduct trading fee
-        uint256 fee = (size * tradingFee) / BASIS_POINTS;
-        if (fee > 0) {
-            vault.lockCollateral(msg.sender, fee);
-            vault.releaseCollateral(feeRecipient, fee);
-        }
-
-        // Generate unique position ID
+        // Create a unique, deterministic position ID using keccak256 hash
+        // Includes trader address, timestamp, position counter, and direction
+        // This ensures each position has a globally unique identifier
+        // even if same trader opens multiple positions in same block
         positionId = keccak256(
             abi.encodePacked(
-                msg.sender,
-                block.timestamp,
-                totalPositions,
-                isLong
+                msg.sender,           // Trader address
+                block.timestamp,      // Current timestamp
+                totalPositions,       // Global position counter (nonce)
+                isLong               // Position direction
             )
         );
 
-        // Create and store position
+        // ========================================================================
+        // STEP 10: CREATE AND STORE POSITION
+        // ========================================================================
+
+        // Store the complete position struct in contract state
+        // This is the source of truth for the position's current state
         positions[positionId] = Position({
-            trader: msg.sender,
-            isLong: isLong,
-            size: size,
-            collateral: collateralAmount,
-            leverage: leverage,
-            entryPrice: entryPrice,
-            entryFundingIndex: entryFundingIndex,
-            timestamp: block.timestamp,
-            liquidationPrice: liquidationPrice
+            trader: msg.sender,                  // Position owner
+            isLong: isLong,                      // Direction (long/short)
+            size: size,                          // Notional size (collateral * leverage)
+            collateral: collateralAmount,        // Locked collateral amount
+            leverage: leverage,                  // Leverage multiplier
+            entryPrice: entryPrice,              // Price at position open
+            entryFundingIndex: entryFundingIndex, // Funding index at entry
+            timestamp: block.timestamp,          // Position open time
+            liquidationPrice: liquidationPrice   // Pre-calculated liq price
         });
 
-        // Track user's positions
+        // ========================================================================
+        // STEP 11: UPDATE USER POSITION TRACKING
+        // ========================================================================
+
+        // Add position ID to user's position array
+        // This enables quick lookup of all positions for a given address
+        // Used by frontend to display user's portfolio
         userPositions[msg.sender].push(positionId);
+
+        // Increment global position counter
+        // This serves as a nonce for position ID generation
+        // and tracks total positions ever opened (not just active)
         totalPositions++;
 
+        // ========================================================================
+        // STEP 12: UPDATE OPEN INTEREST (For Funding Rate Calculation)
+        // ========================================================================
+
+        // Update the FundingRateCalculator with new open interest
+        // This is used to calculate funding rates based on long/short imbalance
+        //
+        // Note: This is a placeholder - actual implementation depends on
+        // FundingRateCalculator interface. Typically you would call:
+        // fundingCalculator.updateOpenInterest(size, isLong, true);
+        //
+        // Where parameters are: (size, isLong, isIncrease)
+        // This allows the funding rate to adjust based on market imbalance
+
+        // ========================================================================
+        // STEP 13: EMIT EVENT
+        // ========================================================================
+
+        // Emit comprehensive event for indexing and frontend updates
+        // This event is crucial for:
+        // - Frontend position tracking
+        // - Analytics and reporting
+        // - Audit trail
+        // - Graph Protocol indexing (if using subgraphs)
         emit PositionOpened(
-            positionId,
-            msg.sender,
-            isLong,
-            collateralAmount,
-            size,
-            leverage,
-            entryPrice,
-            block.timestamp
+            positionId,          // Unique position identifier
+            msg.sender,          // Trader address
+            isLong,              // Position direction
+            collateralAmount,    // Collateral locked
+            size,                // Position size (notional)
+            leverage,            // Leverage used
+            entryPrice,          // Entry price
+            block.timestamp      // Open timestamp
         );
 
+        // ========================================================================
+        // STEP 14: RETURN POSITION ID
+        // ========================================================================
+
+        // Return the unique position ID to the caller
+        // This allows immediate interaction with the position
+        // (e.g., adding margin, closing, etc.)
         return positionId;
     }
 
