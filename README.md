@@ -1,208 +1,92 @@
-# Inflation Market - Smart Contracts
+# Inflation Market Smart Contracts
 
-Decentralized perpetual futures protocol for trading real-world inflation data.
+Inflation Market is a decentralized perpetual futures protocol that lets traders take long or short exposure to real-world inflation indices. This repository contains the core smart contracts, deployment scripts, and test suites that power the protocol.
 
-## Architecture
+## Core Components
 
-### Core Contracts
+- `contracts/PositionManager.sol` – central contract orchestrating the full position lifecycle (open, adjust, close, liquidate).
+- `contracts/Vault.sol` – collateral vault responsible for custody, accounting, and share issuance for liquidity providers.
+- `contracts/IndexOracle.sol` – oracle adapter that pulls Chainlink CPI feeds and maintains historical inflation data.
+- `contracts/FundingRateCalculator.sol` – calculates funding payments that keep perpetual prices anchored to the inflation index.
+- `contracts/Liquidator.sol` – enforces solvency by liquidating unhealthy positions and distributing incentives.
+- `contracts/vAMM.sol` – virtual AMM that simulates inflation perpetual pricing via a constant-product curve.
 
-#### 🎯 PositionManager.sol (THE HEART)
-The central contract managing the entire position lifecycle:
-- Open/close perpetual positions
-- Add/remove collateral
-- Calculate PnL (Profit & Loss)
-- Position health monitoring
-- Liquidation triggers
+Helper contracts live under `contracts/interfaces` and `contracts/mocks` for external integrations and testing support.
 
-**Key Features:**
-- Leverage up to 20x
-- Real-time PnL calculation
-- Funding rate integration
-- Health ratio monitoring
+## Getting Started
 
-#### 💰 Vault.sol
-Manages protocol liquidity and collateral:
-- ERC20 vault shares for liquidity providers
-- Collateral locking/unlocking
-- Liquidity pool management
-- Share-based accounting
-
-#### 📊 IndexOracle.sol
-Chainlink integration for inflation data:
-- Fetches CPI/inflation indices
-- Historical data tracking
-- Price feed updates
-- Oracle source management
-
-#### 💸 FundingRateCalculator.sol
-Maintains price peg through funding rates:
-- Calculates funding rates based on mark vs. index price
-- Time-based funding intervals
-- Rate capping for stability
-- Automatic updates
-
-#### ⚡ Liquidator.sol
-Protocol solvency through position liquidation:
-- Liquidation eligibility checks
-- Liquidator rewards (5% of collateral)
-- Threshold management
-- Automated liquidation execution
-
-#### 🔄 vAMM.sol
-Virtual Automated Market Maker for price discovery:
-- Constant product formula (x * y = k)
-- Virtual reserves (no actual tokens)
-- Price calculation
-- Slippage simulation
-
-## Installation
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-## Configuration
+Copy the environment template and configure network credentials if you plan to deploy:
 
-Create `.env` file:
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your values:
-- `SEPOLIA_RPC_URL` - Alchemy/Infura RPC endpoint
-- `PRIVATE_KEY` - Deployer private key
-- `ETHERSCAN_API_KEY` - For contract verification
+Required variables:
+- `SEPOLIA_RPC_URL` – RPC endpoint for Sepolia testnet.
+- `PRIVATE_KEY` – deployer key (never commit secrets).
+- `ETHERSCAN_API_KEY` – optional, for contract verification.
 
-## Usage
+## Common Tasks
 
-### Compile Contracts
+Compile contracts:
 ```bash
 npm run compile
 ```
 
-### Run Tests
+Run the test suite:
 ```bash
 npm test
 ```
 
-### Test Coverage
+Generate coverage and gas reports:
 ```bash
 npm run test:coverage
-```
-
-### Gas Report
-```bash
 npm run test:gas
 ```
 
-### Deploy to Localhost
+Launch a local Hardhat node and deploy:
 ```bash
-# Terminal 1: Start local node
+# Terminal 1
 npm run node
 
-# Terminal 2: Deploy
+# Terminal 2
 npm run deploy
 ```
 
-### Deploy to Sepolia Testnet
+Deploy to Sepolia:
 ```bash
 npm run deploy:sepolia
 ```
 
-## Contract Addresses (Sepolia Testnet)
+## Protocol Concepts
 
-Coming soon after deployment...
+- **Positions** – traders use `PositionManager` to open leveraged long or short exposure to inflation indices. PnL is tracked in real time using virtual pricing from the vAMM.
+- **Leverage** – configurable leverage up to 20x. Risk parameters (min collateral, leverage caps, liquidation thresholds) are controlled via admin roles.
+- **Funding Rates** – `FundingRateCalculator` compares mark price versus index price and produces time-based funding payments exchanged between longs and shorts.
+- **Liquidations** – if a position’s health drops below the maintenance threshold, the `Liquidator` pays off debt, redistributes remaining collateral, and awards a bounty.
+- **Oracle Data** – `IndexOracle` consumes Chainlink CPI feeds to keep the protocol aligned with real-world inflation metrics.
 
-## Key Concepts
+## Security Practices
 
-### Position Management
-Users can open long or short positions on inflation indices:
-- **Long**: Profit when inflation increases
-- **Short**: Profit when inflation decreases
+- Upgradeable pattern via UUPS and OpenZeppelin libraries.
+- Role-based access control (`ADMIN_ROLE`, `LIQUIDATOR_ROLE`) for sensitive operations.
+- Reentrancy guards, pausable failsafes, and granular custom errors for safer interaction.
+- Extensive tests covering position management, margin adjustments, liquidations, and funding flows.
 
-### Leverage
-Amplify exposure up to 20x with collateral:
-- Higher leverage = higher risk & reward
-- Minimum: 1x, Maximum: 20x
+## Roadmap
 
-### Funding Rates
-Periodic payments between longs and shorts:
-- Keeps perpetual price anchored to index
-- Calculated based on mark vs. index price premium
-- Paid/received every funding interval
-
-### Liquidation
-Undercollateralized positions can be liquidated:
-- Liquidation threshold: 80% health ratio
-- Liquidators receive 5% reward
-- Protects protocol solvency
-
-### Health Ratio
-```
-Health Ratio = Effective Collateral / Required Collateral
-```
-- Above 100%: Healthy position
-- Below 80%: Liquidatable
-
-## Security
-
-- ✅ OpenZeppelin upgradeable contracts
-- ✅ ReentrancyGuard on critical functions
-- ✅ Pausable for emergency stops
-- ✅ UUPS proxy pattern for upgradeability
-- ✅ Access control with Ownable
-
-## Testing
-
-```bash
-# Run all tests
-npm test
-
-# Run specific test file
-npx hardhat test test/PositionManager.test.js
-
-# Run with gas reporting
-REPORT_GAS=true npm test
-```
-
-## Architecture Diagram
-
-```
-┌─────────────────┐
-│  User (Trader)  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────┐      ┌──────────────┐
-│  PositionManager    │◄─────┤    vAMM      │ (Price Discovery)
-│    (THE HEART)      │      └──────────────┘
-└──────────┬──────────┘
-           │
-    ┌──────┴──────┬────────────┬──────────────┐
-    ▼             ▼            ▼              ▼
-┌────────┐   ┌─────────┐  ┌─────────┐   ┌───────────┐
-│ Vault  │   │ Oracle  │  │ Funding │   │Liquidator │
-└────────┘   └─────────┘  └─────────┘   └───────────┘
-    │             │            │              │
-    ▼             ▼            ▼              ▼
-  USDC       Chainlink    Rate Calc      Liquidations
-```
-
-## Development Roadmap
-
-- [x] Core contracts implementation
-- [ ] Comprehensive unit tests
-- [ ] Integration tests
-- [ ] Testnet deployment
-- [ ] Security audit
-- [ ] Mainnet deployment
+- [x] Core contract implementation
+- [ ] Expand test coverage for edge and integration scenarios
+- [ ] Deploy to public testnet with monitoring
+- [ ] Commission external security audit
+- [ ] Mainnet launch
 
 ## License
 
 MIT
-
-## Contact
-
-- Twitter: [@inflationmarket](https://twitter.com/inflationmarket)
-- Discord: [Join our community](https://discord.gg/inflationmarket)
-- Website: [inflationmarket.com](https://inflationmarket.com)
