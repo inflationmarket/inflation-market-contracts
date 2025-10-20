@@ -92,7 +92,7 @@ contract Liquidator is
         override
         returns (bool liquidatable)
     {
-        return positionManager.isLiquidatable(positionId);
+        return positionManager.isPositionLiquidatable(positionId);
     }
 
     /**

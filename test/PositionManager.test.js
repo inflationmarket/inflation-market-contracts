@@ -128,8 +128,9 @@ describe("PositionManager", function () {
     await usdc.connect(trader2).approve(await vault.getAddress(), ethers.MaxUint256);
 
     // Deposit USDC to vault
-    await vault.connect(trader1).deposit(ethers.parseUnits("50000", 6));
-    await vault.connect(trader2).deposit(ethers.parseUnits("50000", 6));
+    const asset = await vault.asset();
+    await vault.connect(trader1).deposit(asset, ethers.parseUnits("50000", 6));
+    await vault.connect(trader2).deposit(asset, ethers.parseUnits("50000", 6));
 
     return {
       positionManager,
@@ -1164,7 +1165,8 @@ describe("PositionManager", function () {
 
       // Withdraw almost all balance (90% of shares)
       const withdrawAmount = (shares * 90n) / 100n;
-      await vault.connect(trader1).withdraw(withdrawAmount);
+      const asset = await vault.asset();
+      await vault.connect(trader1).withdraw(asset, withdrawAmount);
 
       // Remaining balance should be about 10% of original (5000 USDC from 50000)
       // Try to open position requiring much more than that

@@ -328,33 +328,7 @@ contract PositionManager is
         if (size > MAX_POSITION_SIZE) revert PositionTooLarge();
 
         // ========================================================================
-        // STEP 3: LOCK COLLATERAL IN VAULT
-        // ========================================================================
-
-        // Transfer and lock user's collateral in the Vault
-        // This is done BEFORE getting price to follow checks-effects-interactions pattern
-        // Reverts if user hasn't approved enough tokens or has insufficient balance
-        vault.lockCollateral(msg.sender, collateralAmount);
-
-        // ========================================================================
-        // STEP 4: CALCULATE AND DEDUCT TRADING FEE
-        // ========================================================================
-
-        // Calculate trading fee based on position size (not collateral)
-        // Example: 5000 USDC size * 0.1% = 5 USDC fee
-        uint256 fee = (size * tradingFee) / BASIS_POINTS;
-
-        if (fee > 0) {
-            // Lock fee from user's balance (separate from collateral)
-            vault.lockCollateral(msg.sender, fee);
-
-            // Immediately release fee to protocol fee recipient
-            // This ensures fees are collected even if position is immediately liquidated
-            vault.releaseCollateral(feeRecipient, fee);
-        }
-
-        // ========================================================================
-        // STEP 5: GET MARK PRICE FROM vAMM
+        // STEP 3: GET MARK PRICE FROM vAMM
         // ========================================================================
 
         // Get current market price from virtual AMM
@@ -363,7 +337,7 @@ contract PositionManager is
         uint256 entryPrice = vamm.getPrice();
 
         // ========================================================================
-        // STEP 5.5: SLIPPAGE PROTECTION (FIX #2)
+        // STEP 3.5: SLIPPAGE PROTECTION (FIX #2)
         // ========================================================================
 
         // Protect users from front-running and price manipulation
@@ -373,7 +347,47 @@ contract PositionManager is
         if (!isLong && entryPrice < minPrice) revert SlippageExceeded();
 
         // ========================================================================
-        // STEP 6: UPDATE vAMM RESERVES (EXECUTE VIRTUAL SWAP)
+        // STEP 4: CALCULATE AND DEDUCT TRADING FEE
+        // ========================================================================
+
+        // Calculate trading fee based on position size (not collateral)
+        // Example: 5000 USDC size * 0.1% = 5 USDC fee
+        uint256 fee = (size * tradingFee) / BASIS_POINTS;
+
+        // ========================================================================
+        // STEP 5: GENERATE UNIQUE POSITION ID
+        // ========================================================================
+
+        uint256 userNonce = userNonces[msg.sender];
+        positionId = keccak256(
+            abi.encodePacked(
+                msg.sender,           // Trader address
+                block.timestamp,      // Current timestamp
+                totalPositions,       // Global position counter (nonce)
+                isLong,               // Position direction
+                userNonce             // Per-user nonce for collision prevention
+            )
+        );
+
+        // ========================================================================
+        // STEP 6: LOCK COLLATERAL AND COLLECT FEES
+        // ========================================================================
+
+        // Transfer and lock user's collateral in the Vault
+        // Reverts if user hasn't approved enough tokens or has insufficient balance
+        vault.lockCollateral(msg.sender, positionId, collateralAmount);
+
+        if (fee > 0) {
+            // Lock fee from user's balance (separate from collateral)
+            vault.lockCollateral(msg.sender, positionId, fee);
+
+            // Immediately release fee to protocol fee recipient
+            // This ensures fees are collected even if position is immediately liquidated
+            vault.transferCollateral(msg.sender, feeRecipient, fee);
+        }
+
+        // ========================================================================
+        // STEP 7: UPDATE vAMM RESERVES (EXECUTE VIRTUAL SWAP)
         // ========================================================================
 
         // Execute a virtual swap on the vAMM to update reserves
@@ -396,7 +410,7 @@ contract PositionManager is
         }
 
         // ========================================================================
-        // STEP 7: GET CURRENT FUNDING INDEX
+        // STEP 8: GET CURRENT FUNDING INDEX
         // ========================================================================
 
         // Retrieve current funding rate index from FundingRateCalculator
@@ -406,7 +420,7 @@ contract PositionManager is
         uint256 entryFundingIndex = _getCurrentFundingIndex();
 
         // ========================================================================
-        // STEP 8: CALCULATE LIQUIDATION PRICE
+        // STEP 9: CALCULATE LIQUIDATION PRICE
         // ========================================================================
 
         // Calculate the price at which this position becomes liquidatable
@@ -422,24 +436,6 @@ contract PositionManager is
             entryPrice,
             leverage,
             isLong
-        );
-
-        // ========================================================================
-        // STEP 9: GENERATE UNIQUE POSITION ID
-        // ========================================================================
-
-        // Create a unique, deterministic position ID using keccak256 hash
-        // Includes trader address, timestamp, position counter, direction, and user nonce
-        // This ensures each position has a globally unique identifier
-        // even if same trader opens multiple positions in same block
-        positionId = keccak256(
-            abi.encodePacked(
-                msg.sender,           // Trader address
-                block.timestamp,      // Current timestamp
-                totalPositions,       // Global position counter (nonce)
-                isLong,              // Position direction
-                userNonces[msg.sender]++ // FIX #15: Per-user nonce for collision prevention
-            )
         );
 
         // ========================================================================
@@ -476,6 +472,11 @@ contract PositionManager is
 
         // FIX #4: Store position index for O(1) removal later
         positionIndex[msg.sender][positionId] = index;
+
+        unchecked {
+            // FIX #15: Increment per-user nonce after successful position creation
+            userNonces[msg.sender] = userNonce + 1;
+        }
 
         // Increment global position counter
         // This serves as a nonce for position ID generation
@@ -747,7 +748,7 @@ contract PositionManager is
         // Fee is always paid (even on losing positions) unless total loss
         if (closingFee > 0 && (posCollateral > 0)) {  // Use cached value
             // Fee comes from locked collateral, not from settlement
-            vault.releaseCollateral(feeRecipient, closingFee);
+            vault.transferCollateral(posTrader, feeRecipient, closingFee);
         }
 
         // ========================================================================
@@ -758,7 +759,15 @@ contract PositionManager is
         // Only release if there's something to return
         // On total loss scenarios, nothing is returned
         if (finalAmount > 0) {
-            vault.releaseCollateral(msg.sender, finalAmount);
+            vault.unlockCollateral(posTrader, positionId, finalAmount);
+        }
+
+        uint256 collateralAfterFee = posCollateral > closingFee ? posCollateral - closingFee : 0;
+        if (collateralAfterFee > finalAmount) {
+            uint256 residual = collateralAfterFee - finalAmount;
+            if (residual > 0) {
+                vault.writeOffCollateral(posTrader, residual);
+            }
         }
 
         // ========================================================================
@@ -902,12 +911,20 @@ contract PositionManager is
 
             // Transfer closing fee
             if (closingFee > 0 && posCollateral > 0) {
-                vault.releaseCollateral(feeRecipient, closingFee);
+                vault.transferCollateral(msg.sender, feeRecipient, closingFee);
             }
 
             // Release settlement to trader
             if (finalAmount > 0) {
-                vault.releaseCollateral(msg.sender, finalAmount);
+                vault.unlockCollateral(msg.sender, positionId, finalAmount);
+            }
+
+            uint256 collateralAfterFee = posCollateral > closingFee ? posCollateral - closingFee : 0;
+            if (collateralAfterFee > finalAmount) {
+                uint256 residual = collateralAfterFee - finalAmount;
+                if (residual > 0) {
+                    vault.writeOffCollateral(msg.sender, residual);
+                }
             }
 
             // Remove from user tracking
@@ -950,7 +967,7 @@ contract PositionManager is
         if (amount == 0) revert InvalidAmount();
 
         // Lock additional collateral
-        vault.lockCollateral(msg.sender, amount);
+        vault.lockCollateral(msg.sender, positionId, amount);
 
         // Update position
         position.collateral += uint128(amount);
@@ -994,7 +1011,7 @@ contract PositionManager is
         }
 
         // Release collateral to trader
-        vault.releaseCollateral(msg.sender, amount);
+        vault.unlockCollateral(msg.sender, positionId, amount);
 
         // Recalculate liquidation price
         position.liquidationPrice = uint128(_calculateLiquidationPrice(
@@ -1170,14 +1187,14 @@ contract PositionManager is
         // Release liquidator reward from vault
         // This compensates the liquidator for gas costs and monitoring
         if (reward > 0) {
-            vault.releaseCollateral(msg.sender, reward);
+            vault.transferCollateral(trader, msg.sender, reward);
         }
 
         // Release remaining collateral to protocol fee recipient
         // This goes to insurance fund or protocol treasury
         // Helps cover potential protocol losses and fund development
         if (remaining > 0) {
-            vault.releaseCollateral(feeRecipient, remaining);
+            vault.transferCollateral(trader, feeRecipient, remaining);
         }
 
         // ========================================================================
@@ -1337,7 +1354,7 @@ contract PositionManager is
      * - Used in monitoring systems to alert traders of liquidation risk
      */
     function isPositionLiquidatable(bytes32 positionId)
-        external
+        public
         view
         returns (bool)
     {
@@ -1356,6 +1373,13 @@ contract PositionManager is
         // Example: healthRatio = 300 (3%), maintenanceMargin = 500 (5%)
         // Result: 300 < 500 = true (liquidatable)
         return healthRatio < maintenanceMargin;
+    }
+
+    /**
+     * @notice Backwards-compatible alias for external integrations
+     */
+    function isLiquidatable(bytes32 positionId) external view returns (bool) {
+        return isPositionLiquidatable(positionId);
     }
 
     // ============================================================================
@@ -1913,20 +1937,20 @@ contract PositionManager is
      * FIX #4: Use O(1) lookup instead of O(n) loop to prevent DoS
      */
     function _removeUserPosition(address user, bytes32 positionId) internal {
-        bytes32[] storage positions = userPositions[user];
+        bytes32[] storage userPositionList = userPositions[user];
         uint256 index = positionIndex[user][positionId];
-        uint256 lastIndex = positions.length - 1;
+        uint256 lastIndex = userPositionList.length - 1;
 
         // If not the last position, swap with last
         if (index != lastIndex) {
-            bytes32 lastPositionId = positions[lastIndex];
-            positions[index] = lastPositionId;
+            bytes32 lastPositionId = userPositionList[lastIndex];
+            userPositionList[index] = lastPositionId;
             // FIX #4: Update the moved position's index
             positionIndex[user][lastPositionId] = index;
         }
 
         // Remove last element
-        positions.pop();
+        userPositionList.pop();
         // Clean up index mapping
         delete positionIndex[user][positionId];
     }

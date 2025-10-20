@@ -86,4 +86,6 @@ interface IPositionManager {
     function getPositionHealth(bytes32 positionId) external view returns (uint256);
 
     function isLiquidatable(bytes32 positionId) external view returns (bool);
+
+    function isPositionLiquidatable(bytes32 positionId) external view returns (bool);
 }

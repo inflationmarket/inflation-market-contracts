@@ -75,44 +75,46 @@ contract Vault is
      * @param amount Amount of USDC to deposit
      * @return shares Amount of vault shares minted
      */
-    function deposit(uint256 amount)
+    function deposit(address token, uint256 amount)
         external
         override
         nonReentrant
         returns (uint256 shares)
     {
+        require(token == asset, "Unsupported asset");
         require(amount > 0, "Amount must be positive");
 
         shares = convertToShares(amount);
 
         // Transfer USDC from user
-        require(
-            IERC20Upgradeable(asset).transferFrom(msg.sender, address(this), amount),
-            "Transfer failed"
-        );
+        require(IERC20Upgradeable(asset).transferFrom(msg.sender, address(this), amount), "Transfer failed");
 
         // Mint vault shares
         _mint(msg.sender, shares);
 
-        emit Deposit(msg.sender, amount, shares);
+        emit Deposit(msg.sender, token, amount, shares);
         return shares;
     }
 
     /**
      * @notice Withdraw USDC by burning vault shares
-     * @param shares Amount of vault shares to burn
-     * @return amount Amount of USDC withdrawn
+     * @param token Address of the token to withdraw
+     * @param amount Amount of USDC to withdraw
+     * @return shares Amount of vault shares burned
      */
-    function withdraw(uint256 shares)
+    function withdraw(address token, uint256 amount)
         external
         override
         nonReentrant
-        returns (uint256 amount)
+        returns (uint256 shares)
     {
+        require(token == asset, "Unsupported asset");
+        require(amount > 0, "Amount must be positive");
+
+        shares = convertToShares(amount);
         require(shares > 0, "Shares must be positive");
         require(balanceOf(msg.sender) >= shares, "Insufficient shares");
 
-        amount = convertToAssets(shares);
         require(amount <= getAvailableLiquidity(), "Insufficient liquidity");
 
         // Burn vault shares
@@ -121,16 +123,17 @@ contract Vault is
         // Transfer USDC to user
         require(IERC20Upgradeable(asset).transfer(msg.sender, amount), "Transfer failed");
 
-        emit Withdraw(msg.sender, shares, amount);
-        return amount;
+        emit Withdraw(msg.sender, token, amount, shares);
+        return shares;
     }
 
     /**
      * @notice Lock collateral for a position (only PositionManager)
      * @param trader Address of the trader
+     * @param positionId Position identifier (unused placeholder for compatibility)
      * @param amount Amount of collateral to lock
      */
-    function lockCollateral(address trader, uint256 amount)
+    function lockCollateral(address trader, bytes32 positionId, uint256 amount)
         external
         override
         onlyPositionManager
@@ -138,38 +141,105 @@ contract Vault is
         require(amount > 0, "Amount must be positive");
 
         // Transfer collateral from trader
-        require(
-            IERC20Upgradeable(asset).transferFrom(trader, address(this), amount),
-            "Transfer failed"
-        );
+        require(IERC20Upgradeable(asset).transferFrom(trader, address(this), amount), "Transfer failed");
 
         lockedCollateral[trader] += amount;
         totalLockedCollateral += amount;
 
-        emit CollateralLocked(trader, amount);
+        emit CollateralLocked(trader, positionId, amount);
     }
 
     /**
-     * @notice Release collateral (only PositionManager)
+     * @notice Unlock collateral back to user (only PositionManager)
      * @param trader Address of the trader
-     * @param amount Amount of collateral to release
+     * @param positionId Position identifier (unused placeholder for compatibility)
+     * @param amount Amount of collateral to unlock and transfer
      */
-    function releaseCollateral(address trader, uint256 amount)
+    function unlockCollateral(address trader, bytes32 positionId, uint256 amount)
         external
         override
         onlyPositionManager
     {
         require(amount > 0, "Amount must be positive");
 
-        if (lockedCollateral[trader] >= amount) {
-            lockedCollateral[trader] -= amount;
-            totalLockedCollateral -= amount;
+        uint256 lockedAmount = lockedCollateral[trader];
+        uint256 deduction = amount <= lockedAmount ? amount : lockedAmount;
+
+        if (deduction > 0) {
+            lockedCollateral[trader] = lockedAmount - deduction;
+            totalLockedCollateral -= deduction;
         }
 
         // Transfer collateral to trader
         require(IERC20Upgradeable(asset).transfer(trader, amount), "Transfer failed");
 
-        emit CollateralReleased(trader, amount);
+        emit CollateralUnlocked(trader, positionId, amount);
+    }
+
+    /**
+     * @notice Transfer locked collateral to another address (only PositionManager)
+     * @param from Address providing the collateral
+     * @param to Recipient address
+     * @param amount Amount of collateral to transfer
+     */
+    function transferCollateral(address from, address to, uint256 amount)
+        external
+        override
+        onlyPositionManager
+    {
+        require(amount > 0, "Amount must be positive");
+        require(to != address(0), "Invalid recipient");
+
+        uint256 lockedAmount = lockedCollateral[from];
+        require(lockedAmount >= amount, "Insufficient locked collateral");
+
+        lockedCollateral[from] = lockedAmount - amount;
+        totalLockedCollateral -= amount;
+
+        // Transfer collateral to recipient
+        require(IERC20Upgradeable(asset).transfer(to, amount), "Transfer failed");
+
+        emit CollateralTransferred(from, to, amount);
+    }
+
+    /**
+     * @notice Write off locked collateral without transferring tokens (e.g., realized losses)
+     */
+    function writeOffCollateral(address trader, uint256 amount)
+        external
+        override
+        onlyPositionManager
+    {
+        require(amount > 0, "Amount must be positive");
+
+        uint256 lockedAmount = lockedCollateral[trader];
+        if (lockedAmount == 0) {
+            return;
+        }
+
+        uint256 deduction = amount <= lockedAmount ? amount : lockedAmount;
+        lockedCollateral[trader] = lockedAmount - deduction;
+        totalLockedCollateral -= deduction;
+
+        emit CollateralWrittenOff(trader, deduction);
+    }
+
+    /**
+     * @notice Alias for backwards compatibility to release collateral to trader
+     */
+    function releaseCollateral(address trader, uint256 amount) external onlyPositionManager {
+        uint256 lockedAmount = lockedCollateral[trader];
+        uint256 deduction = amount <= lockedAmount ? amount : lockedAmount;
+
+        if (deduction > 0) {
+            lockedCollateral[trader] = lockedAmount - deduction;
+            totalLockedCollateral -= deduction;
+        }
+
+        // Transfer collateral to trader
+        require(IERC20Upgradeable(asset).transfer(trader, amount), "Transfer failed");
+
+        emit CollateralUnlocked(trader, bytes32(0), amount);
     }
 
     // ============================================================================
@@ -229,6 +299,32 @@ contract Vault is
             return 0;
         }
         return (shares * getTotalAssets()) / supply;
+    }
+
+    function availableBalance(address user, address token) external view override returns (uint256) {
+        if (token != asset) {
+            return 0;
+        }
+
+        uint256 unlockedAssets = convertToAssets(balanceOf(user));
+        uint256 locked = lockedCollateral[user];
+        return unlockedAssets > locked ? unlockedAssets - locked : 0;
+    }
+
+    function lockedBalance(address user, address token) external view override returns (uint256) {
+        if (token != asset) {
+            return 0;
+        }
+        return lockedCollateral[user];
+    }
+
+    function totalBalance(address user, address token) external view override returns (uint256) {
+        if (token != asset) {
+            return 0;
+        }
+
+        uint256 unlockedAssets = convertToAssets(balanceOf(user));
+        return unlockedAssets + lockedCollateral[user];
     }
 
     // ============================================================================
