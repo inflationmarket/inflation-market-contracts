@@ -55,14 +55,21 @@ describe("PositionManager", function () {
     await usdc.mint(trader1.address, ethers.parseUnits("100000", 6)); // 100k USDC
     await usdc.mint(trader2.address, ethers.parseUnits("100000", 6));
 
-    // Deploy Vault (temporarily with admin address for positionManager, will update later)
+    // Deploy Vault with new signature: (admin, feeRecipient, tradingFeeRate)
     const Vault = await ethers.getContractFactory("Vault");
     const vault = await upgrades.deployProxy(
       Vault,
-      [await usdc.getAddress(), admin.address],
+      [
+        admin.address,           // admin
+        feeRecipient.address,    // feeRecipient
+        10                       // tradingFeeRate (10 basis points = 0.1%)
+      ],
       { kind: "uups" }
     );
     await vault.waitForDeployment();
+
+    // Add USDC as supported collateral and set as primary
+    await vault.connect(admin).addCollateral(await usdc.getAddress(), 6, true);
 
     // Deploy vAMM with initial reserves (temporarily with admin address for positionManager, will update later)
     const VAMM = await ethers.getContractFactory("vAMM");
@@ -120,8 +127,11 @@ describe("PositionManager", function () {
 
     await fundingCalculator.setPositionManager(await positionManager.getAddress());
 
-    // Set PositionManager addresses in Vault and vAMM
-    await vault.setPositionManager(await positionManager.getAddress());
+    // Grant PositionManager role in Vault
+    const POSITION_MANAGER_ROLE = await vault.POSITION_MANAGER_ROLE();
+    await vault.connect(admin).grantRole(POSITION_MANAGER_ROLE, await positionManager.getAddress());
+
+    // Set PositionManager address in vAMM
     await vamm.setPositionManager(await positionManager.getAddress());
 
     // Grant roles
@@ -382,7 +392,8 @@ describe("PositionManager", function () {
     it("Should lock collateral in vault", async function () {
       const { positionManager, vault, trader1 } = await loadFixture(deployFixture);
 
-      const initialLocked = await vault.lockedCollateral(trader1.address);
+      const asset = await vault.asset();
+      const initialLocked = await vault.lockedBalance(trader1.address, asset);
       const collateral = DEFAULT_COLLATERAL;
 
       await positionManager.connect(trader1).openPosition(
@@ -393,7 +404,7 @@ describe("PositionManager", function () {
         NO_MIN_PRICE,
         NO_MAX_PRICE);
 
-      const finalLocked = await vault.lockedCollateral(trader1.address);
+      const finalLocked = await vault.lockedBalance(trader1.address, asset);
 
       // Locked collateral should increase (includes collateral + fees)
       expect(finalLocked).to.be.greaterThan(initialLocked);
@@ -504,17 +515,15 @@ describe("PositionManager", function () {
       const { positionManager, trader1, positionId, vault } =
         await loadFixture(openPositionFixture);
 
-      const initialLocked = await vault.lockedCollateral(trader1.address);
-      const initialTotalLocked = await vault.totalLockedCollateral();
+      const asset = await vault.asset();
+      const initialLocked = await vault.lockedBalance(trader1.address, asset);
 
       await positionManager.connect(trader1).closePosition(positionId);
 
       // Locked collateral should decrease after closing
-      const finalLocked = await vault.lockedCollateral(trader1.address);
-      const finalTotalLocked = await vault.totalLockedCollateral();
+      const finalLocked = await vault.lockedBalance(trader1.address, asset);
 
       expect(finalLocked).to.be.lessThan(initialLocked);
-      expect(finalTotalLocked).to.be.lessThan(initialTotalLocked);
     });
 
     it("Should emit PositionClosed event", async function () {
@@ -845,7 +854,8 @@ describe("PositionManager", function () {
     it("Should handle complete user flow: open → close", async function () {
       const { positionManager, trader1, vault } = await loadFixture(deployFixture);
 
-      const initialLocked = await vault.lockedCollateral(trader1.address);
+      const asset = await vault.asset();
+      const initialLocked = await vault.lockedBalance(trader1.address, asset);
 
       // Open position
       await positionManager.connect(trader1).openPosition(
@@ -861,7 +871,7 @@ describe("PositionManager", function () {
       expect(positions.length).to.equal(1);
 
       // Verify collateral is locked
-      const lockedAfterOpen = await vault.lockedCollateral(trader1.address);
+      const lockedAfterOpen = await vault.lockedBalance(trader1.address, asset);
       expect(lockedAfterOpen).to.be.greaterThan(initialLocked);
 
       // Close position
@@ -872,7 +882,7 @@ describe("PositionManager", function () {
       expect(positions.length).to.equal(0);
 
       // Verify collateral is mostly unlocked (may have small residual due to fees/rounding)
-      const finalLocked = await vault.lockedCollateral(trader1.address);
+      const finalLocked = await vault.lockedBalance(trader1.address, asset);
       expect(finalLocked).to.be.lessThan(lockedAfterOpen); // Should decrease from opened state
     });
 
@@ -1166,16 +1176,17 @@ describe("PositionManager", function () {
     it("Should prevent operations when vault has insufficient balance", async function () {
       const { positionManager, trader1, vault } = await loadFixture(deployFixture);
 
-      // Get trader's vault balance (shares)
-      const shares = await vault.balanceOf(trader1.address);
-
-      // Withdraw almost all balance (90% of shares)
-      const withdrawAmount = (shares * 90n) / 100n;
       const asset = await vault.asset();
+
+      // Get available balance
+      const availableBalance = await vault.availableBalance(trader1.address, asset);
+
+      // Withdraw most of the balance (80%)
+      const withdrawAmount = (availableBalance * 80n) / 100n;
       await vault.connect(trader1).withdraw(asset, withdrawAmount);
 
-      // Remaining balance should be about 10% of original (5000 USDC from 50000)
-      // Try to open position requiring much more than that
+      // Remaining balance should be about 20% of original
+      // Try to open position with remaining balance
       const result = await positionManager.connect(trader1).openPosition(
         true,
         ethers.parseUnits("1000", 6), // Should work with remaining balance
