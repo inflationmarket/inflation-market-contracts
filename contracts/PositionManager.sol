@@ -69,6 +69,8 @@ contract PositionManager is
     // Position tracking
     mapping(bytes32 => Position) public positions;
     mapping(address => bytes32[]) public userPositions;
+    mapping(address => mapping(bytes32 => uint256)) private positionIndex; // FIX #4: O(1) position lookup
+    mapping(address => uint256) private userNonces; // FIX #15: Prevent position ID collisions
     uint256 public totalPositions;
 
     // Risk parameters
@@ -86,6 +88,10 @@ contract PositionManager is
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant MIN_LEVERAGE = 1e18;      // 1x
     uint256 public constant MAX_LEVERAGE_CAP = 20e18;  // 20x hard cap
+    uint256 public constant MAX_POSITION_SIZE = 1_000_000_000e6; // FIX #1: 1 billion USDC max
+    uint256 public constant MAX_POSITIONS_PER_USER = 50; // FIX #7: Prevent DoS
+    uint256 public constant MIN_MAINTENANCE_MARGIN = 100; // FIX #10: 1% minimum
+    uint256 public constant MAX_MAINTENANCE_MARGIN = 2000; // FIX #10: 20% maximum
 
     // ============================================================================
     // EVENTS
@@ -146,6 +152,9 @@ contract PositionManager is
         address newAddress
     );
 
+    event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient); // FIX #9
+    event MinCollateralUpdated(uint256 oldAmount, uint256 newAmount); // FIX #9
+
     // ============================================================================
     // ERRORS
     // ============================================================================
@@ -159,6 +168,11 @@ contract PositionManager is
     error InvalidAmount();
     error PositionUnhealthy();
     error FeeTooHigh();
+    error PositionTooLarge(); // FIX #1
+    error TooManyPositions(); // FIX #7
+    error SlippageExceeded(); // FIX #2
+    error InvalidMaintenanceMargin(); // FIX #10
+    error SwapFailed(bytes data); // FIX #13
 
     // ============================================================================
     // INITIALIZATION
@@ -265,12 +279,19 @@ contract PositionManager is
     function openPosition(
         bool isLong,
         uint256 collateralAmount,
-        uint256 leverage
+        uint256 leverage,
+        uint256 minPrice,  // FIX #2: Slippage protection for shorts (minimum acceptable price)
+        uint256 maxPrice   // FIX #2: Slippage protection for longs (maximum acceptable price)
     ) external nonReentrant whenNotPaused returns (bytes32 positionId) {
 
         // ========================================================================
         // STEP 1: INPUT VALIDATION
         // ========================================================================
+
+        // FIX #7: Check maximum positions per user (prevent DoS)
+        if (userPositions[msg.sender].length >= MAX_POSITIONS_PER_USER) {
+            revert TooManyPositions();
+        }
 
         // Validate collateral meets minimum requirement (default 10 USDC)
         // This prevents dust positions that would be unprofitable to liquidate
@@ -292,6 +313,9 @@ contract PositionManager is
         // Example: 1000 USDC * 5x = 5000 USDC notional exposure
         // Division by PRECISION (1e18) because leverage is scaled
         uint256 size = (collateralAmount * leverage) / PRECISION;
+
+        // FIX #1: Validate position size doesn't exceed maximum
+        if (size > MAX_POSITION_SIZE) revert PositionTooLarge();
 
         // ========================================================================
         // STEP 3: LOCK COLLATERAL IN VAULT
@@ -329,6 +353,16 @@ contract PositionManager is
         uint256 entryPrice = vamm.getPrice();
 
         // ========================================================================
+        // STEP 5.5: SLIPPAGE PROTECTION (FIX #2)
+        // ========================================================================
+
+        // Protect users from front-running and price manipulation
+        // Long positions: revert if price is too high (exceeds maxPrice)
+        // Short positions: revert if price is too low (below minPrice)
+        if (isLong && entryPrice > maxPrice) revert SlippageExceeded();
+        if (!isLong && entryPrice < minPrice) revert SlippageExceeded();
+
+        // ========================================================================
         // STEP 6: UPDATE vAMM RESERVES (EXECUTE VIRTUAL SWAP)
         // ========================================================================
 
@@ -343,11 +377,12 @@ contract PositionManager is
             // Swap successful - vAMM reserves updated
             // The return value represents the amount received from the swap
             // We don't need it here as we're using the pre-swap price as entry price
-        } catch {
-            // If vAMM swap fails (e.g., excessive slippage), position opening fails
-            // This protects users from opening positions at unfavorable prices
-            // In production, consider custom error with slippage details
-            revert("vAMM swap failed");
+        } catch Error(string memory reason) {
+            // FIX #13: Better error messages - include reason from vAMM
+            revert(string(abi.encodePacked("vAMM swap failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            // FIX #13: Handle low-level failures with custom error
+            revert SwapFailed(lowLevelData);
         }
 
         // ========================================================================
@@ -384,7 +419,7 @@ contract PositionManager is
         // ========================================================================
 
         // Create a unique, deterministic position ID using keccak256 hash
-        // Includes trader address, timestamp, position counter, and direction
+        // Includes trader address, timestamp, position counter, direction, and user nonce
         // This ensures each position has a globally unique identifier
         // even if same trader opens multiple positions in same block
         positionId = keccak256(
@@ -392,7 +427,8 @@ contract PositionManager is
                 msg.sender,           // Trader address
                 block.timestamp,      // Current timestamp
                 totalPositions,       // Global position counter (nonce)
-                isLong               // Position direction
+                isLong,              // Position direction
+                userNonces[msg.sender]++ // FIX #15: Per-user nonce for collision prevention
             )
         );
 
@@ -421,7 +457,11 @@ contract PositionManager is
         // Add position ID to user's position array
         // This enables quick lookup of all positions for a given address
         // Used by frontend to display user's portfolio
+        uint256 index = userPositions[msg.sender].length;
         userPositions[msg.sender].push(positionId);
+
+        // FIX #4: Store position index for O(1) removal later
+        positionIndex[msg.sender][positionId] = index;
 
         // Increment global position counter
         // This serves as a nonce for position ID generation
@@ -1259,7 +1299,11 @@ contract PositionManager is
         // - Position size: 1500 USDC (500 collateral * 3x leverage)
         // - P&L = (-$100 / $2000) * 1500 = -0.05 * 1500 = -75 USDC
         // - This is a 15% loss on the 500 USDC collateral
-        pnl = (priceDelta * int256(position.size)) / int256(position.entryPrice);
+
+        // FIX #6: Improved precision - scale delta first, then apply to size
+        // This prevents precision loss with small price changes
+        int256 scaledDelta = (priceDelta * int256(PRECISION)) / int256(position.entryPrice);
+        pnl = (scaledDelta * int256(position.size)) / int256(PRECISION);
 
         // ====================================================================
         // STEP 5: SUBTRACT FUNDING PAYMENTS
@@ -1698,19 +1742,25 @@ contract PositionManager is
 
     /**
      * @dev Remove position from user's position array
+     * FIX #4: Use O(1) lookup instead of O(n) loop to prevent DoS
      */
     function _removeUserPosition(address user, bytes32 positionId) internal {
-        bytes32[] storage userPositionList = userPositions[user];
-        uint256 length = userPositionList.length;
+        bytes32[] storage positions = userPositions[user];
+        uint256 index = positionIndex[user][positionId];
+        uint256 lastIndex = positions.length - 1;
 
-        for (uint256 i = 0; i < length; i++) {
-            if (userPositionList[i] == positionId) {
-                // Move last element to current position and pop
-                userPositionList[i] = userPositionList[length - 1];
-                userPositionList.pop();
-                break;
-            }
+        // If not the last position, swap with last
+        if (index != lastIndex) {
+            bytes32 lastPositionId = positions[lastIndex];
+            positions[index] = lastPositionId;
+            // FIX #4: Update the moved position's index
+            positionIndex[user][lastPositionId] = index;
         }
+
+        // Remove last element
+        positions.pop();
+        // Clean up index mapping
+        delete positionIndex[user][positionId];
     }
 
     // ============================================================================
@@ -1731,6 +1781,13 @@ contract PositionManager is
         uint256 _liquidationFee
     ) external onlyRole(ADMIN_ROLE) {
         if (_maxLeverage > MAX_LEVERAGE_CAP) revert InvalidLeverage();
+
+        // FIX #10: Validate maintenance margin is within acceptable bounds
+        if (_maintenanceMargin < MIN_MAINTENANCE_MARGIN ||
+            _maintenanceMargin > MAX_MAINTENANCE_MARGIN) {
+            revert InvalidMaintenanceMargin();
+        }
+
         if (_tradingFee > 1000) revert FeeTooHigh(); // Max 10%
         if (_liquidationFee > 1000) revert FeeTooHigh(); // Max 10%
 
@@ -1792,14 +1849,18 @@ contract PositionManager is
      */
     function setFeeRecipient(address _feeRecipient) external onlyRole(ADMIN_ROLE) {
         if (_feeRecipient == address(0)) revert ZeroAddress();
+        address oldRecipient = feeRecipient;
         feeRecipient = _feeRecipient;
+        emit FeeRecipientUpdated(oldRecipient, _feeRecipient); // FIX #9
     }
 
     /**
      * @notice Update minimum collateral requirement
      */
     function setMinCollateral(uint256 _minCollateral) external onlyRole(ADMIN_ROLE) {
+        uint256 oldAmount = minCollateral;
         minCollateral = _minCollateral;
+        emit MinCollateralUpdated(oldAmount, _minCollateral); // FIX #9
     }
 
     /**
@@ -1824,4 +1885,20 @@ contract PositionManager is
         override
         onlyRole(ADMIN_ROLE)
     {}
+
+    // ============================================================================
+    // UPGRADE SAFETY
+    // ============================================================================
+
+    /**
+     * @dev Gap for future storage variables in upgrades
+     * FIX #14: Reserves 50 storage slots to allow adding new state variables
+     * in future upgrades without breaking storage layout
+     *
+     * When adding new state variables in an upgrade:
+     * 1. Add them BEFORE this gap
+     * 2. Reduce the gap size by the number of slots used
+     * Example: If you add 2 new uint256 variables, change [50] to [48]
+     */
+    uint256[50] private __gap;
 }
