@@ -70,7 +70,7 @@ describe("PositionManager", function () {
     const initialQuoteReserve = ethers.parseEther("2000000000"); // 2B quote (price = 2000)
     const vamm = await upgrades.deployProxy(
       VAMM,
-      [initialBaseReserve, initialQuoteReserve, admin.address],
+      [initialBaseReserve, initialQuoteReserve],
       { kind: "uups" }
     );
     await vamm.waitForDeployment();
@@ -92,7 +92,11 @@ describe("PositionManager", function () {
       [
         await vamm.getAddress(),
         await oracle.getAddress(),
-        fundingInterval
+        ethers.ZeroAddress,
+        fundingInterval,
+        0,
+        0,
+        0
       ],
       { kind: "uups" }
     );
@@ -113,6 +117,8 @@ describe("PositionManager", function () {
       { kind: "uups" }
     );
     await positionManager.waitForDeployment();
+
+    await fundingCalculator.setPositionManager(await positionManager.getAddress());
 
     // Set PositionManager addresses in Vault and vAMM
     await vault.setPositionManager(await positionManager.getAddress());

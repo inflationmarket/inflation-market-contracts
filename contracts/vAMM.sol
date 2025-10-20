@@ -9,41 +9,27 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 import "./interfaces/IvAMM.sol";
 
 /**
- * @title vAMM (Virtual Automated Market Maker)
- * @notice Provides price discovery without requiring actual asset reserves
- * @dev Uses constant product formula (x * y = k) with virtual reserves
+ * @title vAMM
+ * @notice Virtual AMM providing mark price discovery for Inflation Market.
  */
-contract vAMM is
-    Initializable,
-    OwnableUpgradeable,
-    UUPSUpgradeable,
-    ReentrancyGuardUpgradeable,
-    IvAMM
-{
-    // ============================================================================
-    // STATE VARIABLES
-    // ============================================================================
+contract vAMM is Initializable, OwnableUpgradeable, UUPSUpgradeable, ReentrancyGuardUpgradeable, IvAMM {
+    uint256 private constant PRECISION = 1e18;
+    uint256 private constant BASIS_POINTS = 10_000;
 
-    uint256 public baseReserve; // Virtual base asset reserve
-    uint256 public quoteReserve; // Virtual quote asset reserve (USDC)
-    uint256 public k; // Constant product (x * y = k)
+    uint256 private _baseReserve;
+    uint256 private _quoteReserve;
+    uint256 private _k;
 
-    uint256 public constant PRECISION = 1e18;
+    uint256 private _lastMarkPrice;
+    uint256 private _lastPriceUpdate;
 
-    address public positionManager;
+    uint256 private _totalLongOI;
+    uint256 private _totalShortOI;
 
-    // ============================================================================
-    // MODIFIERS
-    // ============================================================================
+    uint256 private _maxPriceImpact; // basis points
+    address private _positionManager;
 
-    modifier onlyPositionManager() {
-        require(msg.sender == positionManager, "Only PositionManager");
-        _;
-    }
-
-    // ============================================================================
-    // INITIALIZATION
-    // ============================================================================
+    bool private _initialized;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -51,175 +37,184 @@ contract vAMM is
     }
 
     function initialize(
-        uint256 _baseReserve,
-        uint256 _quoteReserve,
-        address _positionManager
-    ) public initializer {
+        uint256 baseReserve_,
+        uint256 quoteReserve_
+    ) external initializer {
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
-        require(_baseReserve > 0, "Invalid base reserve");
-        require(_quoteReserve > 0, "Invalid quote reserve");
-        require(_positionManager != address(0), "Invalid PositionManager");
+        if (_initialized) revert AlreadyInitialized();
+        if (baseReserve_ == 0 || quoteReserve_ == 0) revert InvalidReserves();
 
-        baseReserve = _baseReserve;
-        quoteReserve = _quoteReserve;
-        k = _baseReserve * _quoteReserve;
-        positionManager = _positionManager;
+        _baseReserve = baseReserve_;
+        _quoteReserve = quoteReserve_;
+        _k = baseReserve_ * quoteReserve_;
 
-        emit LiquidityUpdated(baseReserve, quoteReserve);
+        _positionManager = address(0);
+        _maxPriceImpact = 1_000; // 10%
+
+        _updateMarkPrice();
+        _initialized = true;
+
+        emit VammInitialized(_baseReserve, _quoteReserve);
     }
 
-    // ============================================================================
-    // CORE FUNCTIONS
-    // ============================================================================
+    modifier onlyPositionManager() {
+        require(msg.sender == _positionManager, "not position manager");
+        _;
+    }
 
-    /**
-     * @notice Execute a swap (virtual trade)
-     * @param amountIn Amount to swap in
-     * @param isLong True for long (buy base), false for short (sell base)
-     * @return amountOut Amount received
-     */
-    function swap(uint256 amountIn, bool isLong)
-        external
-        override
-        onlyPositionManager
-        nonReentrant
-        returns (uint256 amountOut)
-    {
-        require(amountIn > 0, "Amount must be positive");
+    // ==========================================================================
+    // VIEW FUNCTIONS
+    // ==========================================================================
 
-        if (isLong) {
-            // Buy base asset with quote
-            amountOut = getAmountOut(amountIn, isLong);
-            quoteReserve += amountIn;
-            baseReserve -= amountOut;
+    function getMarkPrice() public view override returns (uint256) {
+        if (_baseReserve == 0) revert InvalidReserves();
+        return (_quoteReserve * PRECISION) / _baseReserve;
+    }
+
+    function getPriceForTrade(
+        int256 size
+    ) external view override returns (uint256 newMarkPrice, uint256 priceImpact) {
+        (uint256 newBase, uint256 newQuote) = _previewReserves(size);
+        if (newBase == 0) revert InvalidReserves();
+
+        uint256 oldPrice = getMarkPrice();
+        newMarkPrice = (newQuote * PRECISION) / newBase;
+
+        if (oldPrice == 0) {
+            priceImpact = 0;
         } else {
-            // Sell base asset for quote
-            amountOut = getAmountOut(amountIn, isLong);
-            baseReserve += amountIn;
-            quoteReserve -= amountOut;
+            uint256 diff = oldPrice > newMarkPrice ? oldPrice - newMarkPrice : newMarkPrice - oldPrice;
+            priceImpact = (diff * BASIS_POINTS) / oldPrice;
+        }
+    }
+
+    function virtualBaseAssetReserve() external view override returns (uint256) {
+        return _baseReserve;
+    }
+
+    function virtualQuoteAssetReserve() external view override returns (uint256) {
+        return _quoteReserve;
+    }
+
+    function k() external view override returns (uint256) {
+        return _k;
+    }
+
+    function lastMarkPrice() external view override returns (uint256) {
+        return _lastMarkPrice;
+    }
+
+    function lastPriceUpdateTime() external view override returns (uint256) {
+        return _lastPriceUpdate;
+    }
+
+    function totalLongOpenInterest() external view override returns (uint256) {
+        return _totalLongOI;
+    }
+
+    function totalShortOpenInterest() external view override returns (uint256) {
+        return _totalShortOI;
+    }
+
+    function maxPriceImpact() external view override returns (uint256) {
+        return _maxPriceImpact;
+    }
+
+    // ==========================================================================
+    // STATE-CHANGING FUNCTIONS
+    // ==========================================================================
+
+    function updateReserves(int256 size) external override onlyPositionManager nonReentrant {
+        if (size == 0) return;
+
+        (uint256 newBase, uint256 newQuote) = _previewReserves(size);
+        uint256 newPrice = (newQuote * PRECISION) / newBase;
+
+        if (_lastMarkPrice != 0) {
+            uint256 diff = _lastMarkPrice > newPrice ? _lastMarkPrice - newPrice : newPrice - _lastMarkPrice;
+            if ((_lastMarkPrice != 0 ? (diff * BASIS_POINTS) / _lastMarkPrice : 0) > _maxPriceImpact) {
+                revert PriceImpactTooHigh();
+            }
         }
 
-        uint256 newPrice = getPrice();
+        _applyOpenInterest(size);
 
-        emit Swap(msg.sender, isLong, amountIn, amountOut, newPrice);
-        emit LiquidityUpdated(baseReserve, quoteReserve);
+        _baseReserve = newBase;
+        _quoteReserve = newQuote;
+        _k = _baseReserve * _quoteReserve;
 
-        return amountOut;
+        _updateMarkPrice();
+
+        emit ReservesUpdated(_baseReserve, _quoteReserve);
+        emit MarkPriceUpdated(_lastMarkPrice, _lastPriceUpdate);
     }
 
-    /**
-     * @notice Get current price (quote per base)
-     * @return price Current price scaled by PRECISION
-     */
-    function getPrice() public view override returns (uint256 price) {
-        // Price = quoteReserve / baseReserve
-        price = (quoteReserve * PRECISION) / baseReserve;
-        return price;
+    function rebalanceToIndex(uint256 indexPrice) external override onlyPositionManager {
+        if (indexPrice == 0) revert InvalidReserves();
+        _lastMarkPrice = indexPrice;
+        _quoteReserve = (indexPrice * _baseReserve) / PRECISION;
+        _k = _baseReserve * _quoteReserve;
+        _lastPriceUpdate = block.timestamp;
+
+        emit ReservesRebalanced(_baseReserve, _quoteReserve);
+        emit MarkPriceUpdated(_lastMarkPrice, _lastPriceUpdate);
     }
 
-    /**
-     * @notice Get current reserves
-     * @return _baseReserve Base reserve amount
-     * @return _quoteReserve Quote reserve amount
-     */
-    function getReserves()
-        external
-        view
-        override
-        returns (uint256 _baseReserve, uint256 _quoteReserve)
-    {
-        return (baseReserve, quoteReserve);
+    function setMaxPriceImpact(uint256 maxImpact) external override onlyOwner {
+        if (maxImpact == 0 || maxImpact > BASIS_POINTS) revert InvalidReserves();
+        uint256 oldImpact = _maxPriceImpact;
+        _maxPriceImpact = maxImpact;
+        emit MaxPriceImpactUpdated(oldImpact, maxImpact);
     }
 
-    /**
-     * @notice Add liquidity (admin only)
-     * @param baseAmount Base amount to add
-     * @param quoteAmount Quote amount to add
-     */
-    function addLiquidity(uint256 baseAmount, uint256 quoteAmount)
-        external
-        override
-        onlyOwner
-    {
-        require(baseAmount > 0 && quoteAmount > 0, "Invalid amounts");
-
-        baseReserve += baseAmount;
-        quoteReserve += quoteAmount;
-        k = baseReserve * quoteReserve;
-
-        emit LiquidityUpdated(baseReserve, quoteReserve);
+    function setPositionManager(address positionManager_) external override onlyOwner {
+        if (positionManager_ == address(0)) revert InvalidReserves();
+        _positionManager = positionManager_;
     }
 
-    /**
-     * @notice Remove liquidity (admin only)
-     * @param liquidity Percentage of liquidity to remove (in basis points)
-     * @return base Base amount removed
-     * @return quote Quote amount removed
-     */
-    function removeLiquidity(uint256 liquidity)
-        external
-        override
-        onlyOwner
-        returns (uint256 base, uint256 quote)
-    {
-        require(liquidity <= 10000, "Invalid liquidity");
+    // ==========================================================================
+    // INTERNAL HELPERS
+    // ==========================================================================
 
-        base = (baseReserve * liquidity) / 10000;
-        quote = (quoteReserve * liquidity) / 10000;
-
-        baseReserve -= base;
-        quoteReserve -= quote;
-        k = baseReserve * quoteReserve;
-
-        emit LiquidityUpdated(baseReserve, quoteReserve);
-
-        return (base, quote);
-    }
-
-    /**
-     * @notice Calculate output amount for a given input
-     * @param amountIn Input amount
-     * @param isLong Direction of trade
-     * @return amountOut Output amount
-     */
-    function getAmountOut(uint256 amountIn, bool isLong)
-        public
-        view
-        override
-        returns (uint256 amountOut)
-    {
-        require(amountIn > 0, "Amount must be positive");
-
-        if (isLong) {
-            // Buying base with quote: k = (quoteReserve + amountIn) * (baseReserve - amountOut)
-            uint256 newQuoteReserve = quoteReserve + amountIn;
-            uint256 newBaseReserve = k / newQuoteReserve;
-            amountOut = baseReserve - newBaseReserve;
+    function _previewReserves(int256 size) internal view returns (uint256 newBase, uint256 newQuote) {
+        if (size > 0) {
+            uint256 amountIn = uint256(size);
+            newQuote = _quoteReserve + amountIn;
+            newBase = _k / newQuote;
+            if (newBase >= _baseReserve) revert InsufficientLiquidity();
         } else {
-            // Selling base for quote: k = (baseReserve + amountIn) * (quoteReserve - amountOut)
-            uint256 newBaseReserve = baseReserve + amountIn;
-            uint256 newQuoteReserve = k / newBaseReserve;
-            amountOut = quoteReserve - newQuoteReserve;
+            uint256 amountIn = uint256(-size);
+            newBase = _baseReserve + amountIn;
+            newQuote = _k / newBase;
+            if (newQuote >= _quoteReserve) revert InsufficientLiquidity();
         }
-
-        return amountOut;
     }
 
-    // ============================================================================
-    // ADMIN FUNCTIONS
-    // ============================================================================
-
-    function setPositionManager(address _positionManager) external onlyOwner {
-        require(_positionManager != address(0), "Invalid address");
-        positionManager = _positionManager;
+    function _applyOpenInterest(int256 size) internal {
+        if (size > 0) {
+            uint256 delta = uint256(size);
+            if (delta > _totalShortOI) {
+                _totalLongOI += delta;
+            } else {
+                _totalShortOI -= delta;
+            }
+        } else {
+            uint256 delta = uint256(-size);
+            if (delta > _totalLongOI) {
+                _totalShortOI += delta;
+            } else {
+                _totalLongOI -= delta;
+            }
+        }
     }
 
-    function _authorizeUpgrade(address newImplementation)
-        internal
-        override
-        onlyOwner
-    {}
+    function _updateMarkPrice() internal {
+        _lastMarkPrice = getMarkPrice();
+        _lastPriceUpdate = block.timestamp;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

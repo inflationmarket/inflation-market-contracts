@@ -7,31 +7,25 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import "./interfaces/ILiquidator.sol";
 import "./interfaces/IPositionManager.sol";
+import "./interfaces/IVault.sol";
+import "./interfaces/IIndexOracle.sol";
 
 /**
  * @title Liquidator
- * @notice Handles liquidation of undercollateralized positions
- * @dev Provides incentives for liquidators to maintain protocol solvency
+ * @notice Executes liquidations and manages the protocol insurance fund.
  */
-contract Liquidator is
-    Initializable,
-    OwnableUpgradeable,
-    UUPSUpgradeable,
-    ILiquidator
-{
-    // ============================================================================
-    // STATE VARIABLES
-    // ============================================================================
+contract Liquidator is Initializable, OwnableUpgradeable, UUPSUpgradeable, ILiquidator {
+    uint256 private constant BASIS_POINTS = 10_000;
 
-    IPositionManager public positionManager;
-    uint256 public liquidationThreshold; // Threshold for liquidation (e.g., 8000 = 80%)
-    uint256 public liquidationRewardBps; // Reward in basis points (e.g., 500 = 5%)
+    IPositionManager private _positionManager;
+    IVault private _vault;
+    IIndexOracle private _indexOracle;
 
-    uint256 public constant BASIS_POINTS = 10000;
+    uint256 private _liquidationFeePercent;
+    uint256 private _liquidatorRewardPercent;
 
-    // ============================================================================
-    // INITIALIZATION
-    // ============================================================================
+    address private _insuranceFund;
+    uint256 private _insuranceFundBalance;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -39,123 +33,143 @@ contract Liquidator is
     }
 
     function initialize(
-        address _positionManager,
-        uint256 _liquidationThreshold,
-        uint256 _liquidationRewardBps
-    ) public initializer {
+        address positionManager_,
+        address vault_,
+        address oracle_,
+        address insuranceFund_,
+        uint256 liquidationFeePercent_,
+        uint256 liquidatorRewardPercent_
+    ) external initializer {
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
 
-        require(_positionManager != address(0), "Invalid PositionManager");
-        require(_liquidationThreshold < BASIS_POINTS, "Invalid threshold");
-        require(_liquidationRewardBps < BASIS_POINTS, "Invalid reward");
+        if (
+            positionManager_ == address(0) ||
+            vault_ == address(0) ||
+            oracle_ == address(0) ||
+            insuranceFund_ == address(0)
+        ) {
+            revert InvalidLiquidationParameters();
+        }
 
-        positionManager = IPositionManager(_positionManager);
-        liquidationThreshold = _liquidationThreshold;
-        liquidationRewardBps = _liquidationRewardBps;
+        _positionManager = IPositionManager(positionManager_);
+        _vault = IVault(vault_);
+        _indexOracle = IIndexOracle(oracle_);
+        _insuranceFund = insuranceFund_;
+
+        _setLiquidationFee(liquidationFeePercent_);
+        _setLiquidatorReward(liquidatorRewardPercent_);
     }
 
-    // ============================================================================
-    // CORE FUNCTIONS
-    // ============================================================================
+    // ==========================================================================
+    // VIEW FUNCTIONS
+    // ==========================================================================
 
-    /**
-     * @notice Liquidate an undercollateralized position
-     * @param positionId ID of the position to liquidate
-     * @return reward Liquidation reward paid to caller
-     */
-    function liquidate(bytes32 positionId)
-        external
-        override
-        returns (uint256 reward)
-    {
-        require(canLiquidate(positionId), "Position not liquidatable");
-
-        // Calculate reward before liquidation
-        reward = calculateLiquidationReward(positionId);
-
-        // Trigger liquidation in PositionManager
-        positionManager.liquidatePosition(positionId);
-
-        emit PositionLiquidated(positionId, msg.sender, reward);
-        return reward;
+    function isLiquidatable(bytes32 positionId) public view override returns (bool) {
+        return _positionManager.isPositionLiquidatable(positionId);
     }
 
-    /**
-     * @notice Check if a position can be liquidated
-     * @param positionId ID of the position
-     * @return liquidatable True if position is liquidatable
-     */
-    function canLiquidate(bytes32 positionId)
-        public
-        view
-        override
-        returns (bool liquidatable)
-    {
-        return positionManager.isPositionLiquidatable(positionId);
+    function liquidationFeePercent() external view override returns (uint256) {
+        return _liquidationFeePercent;
     }
 
-    /**
-     * @notice Calculate liquidation reward for a position
-     * @param positionId ID of the position
-     * @return reward Reward amount
-     */
-    function calculateLiquidationReward(bytes32 positionId)
-        public
-        view
-        override
-        returns (uint256 reward)
-    {
-        IPositionManager.Position memory position = positionManager.getPosition(positionId);
-
-        // Reward = liquidationRewardBps % of collateral
-        reward = (position.collateral * liquidationRewardBps) / BASIS_POINTS;
-
-        return reward;
+    function liquidatorRewardPercent() external view override returns (uint256) {
+        return _liquidatorRewardPercent;
     }
 
-    /**
-     * @notice Set new liquidation threshold
-     * @param threshold New threshold value
-     */
-    function setLiquidationThreshold(uint256 threshold)
-        external
-        override
-        onlyOwner
-    {
-        require(threshold < BASIS_POINTS, "Invalid threshold");
-        liquidationThreshold = threshold;
-        emit LiquidationThresholdUpdated(threshold);
+    function insuranceFund() external view override returns (address) {
+        return _insuranceFund;
     }
 
-    /**
-     * @notice Get current liquidation threshold
-     * @return threshold Current threshold
-     */
-    function getLiquidationThreshold()
-        external
-        view
-        override
-        returns (uint256 threshold)
-    {
-        return liquidationThreshold;
+    function insuranceFundBalance() external view override returns (uint256) {
+        return _insuranceFundBalance;
     }
 
-    // ============================================================================
-    // ADMIN FUNCTIONS
-    // ============================================================================
-
-    function setLiquidationReward(uint256 _liquidationRewardBps)
-        external
-        onlyOwner
-    {
-        require(_liquidationRewardBps < BASIS_POINTS, "Invalid reward");
-        liquidationRewardBps = _liquidationRewardBps;
+    function getInsuranceFundRatio() external view override returns (uint256) {
+        if (_insuranceFundBalance == 0) return 0;
+        // Without full system metrics, expose ratio against liquidation fee schedule.
+        return (_insuranceFundBalance * BASIS_POINTS) / (_liquidationFeePercent == 0 ? 1 : _liquidationFeePercent);
     }
 
-    function _authorizeUpgrade(address newImplementation)
-        internal
-        override
-        onlyOwner
-    {}
+    function positionManager() external view override returns (address) {
+        return address(_positionManager);
+    }
+
+    function vault() external view override returns (address) {
+        return address(_vault);
+    }
+
+    function indexOracle() external view override returns (address) {
+        return address(_indexOracle);
+    }
+
+    // ==========================================================================
+    // STATE-CHANGING FUNCTIONS
+    // ==========================================================================
+
+    function liquidatePosition(bytes32 positionId) external override {
+        if (!isLiquidatable(positionId)) revert PositionNotLiquidatable();
+
+        IPositionManager.Position memory position = _positionManager.getPosition(positionId);
+        _positionManager.liquidatePosition(positionId);
+
+        emit PositionLiquidated(positionId, position.trader, msg.sender, 0, 0);
+    }
+
+    function batchLiquidate(bytes32[] calldata positionIds) external override {
+        for (uint256 i = 0; i < positionIds.length; ++i) {
+            if (!isLiquidatable(positionIds[i])) {
+                continue;
+            }
+
+            IPositionManager.Position memory position = _positionManager.getPosition(positionIds[i]);
+            _positionManager.liquidatePosition(positionIds[i]);
+            emit PositionLiquidated(positionIds[i], position.trader, msg.sender, 0, 0);
+        }
+    }
+
+    function setLiquidationFee(uint256 feePercent) external override onlyOwner {
+        _setLiquidationFee(feePercent);
+        emit LiquidationParametersUpdated(_liquidationFeePercent, _liquidatorRewardPercent);
+    }
+
+    function setLiquidatorReward(uint256 rewardPercent) external override onlyOwner {
+        _setLiquidatorReward(rewardPercent);
+        emit LiquidationParametersUpdated(_liquidationFeePercent, _liquidatorRewardPercent);
+    }
+
+    function setInsuranceFund(address insuranceFund_) external override onlyOwner {
+        if (insuranceFund_ == address(0)) revert InvalidLiquidationParameters();
+        address oldFund = _insuranceFund;
+        _insuranceFund = insuranceFund_;
+        emit InsuranceFundUpdated(oldFund, insuranceFund_);
+    }
+
+    function depositToInsuranceFund(uint256 amount) external override onlyOwner {
+        if (amount == 0) revert InvalidLiquidationParameters();
+        _insuranceFundBalance += amount;
+        emit InsuranceFundDeposit(amount, _insuranceFundBalance);
+    }
+
+    function withdrawFromInsuranceFund(uint256 amount) external override onlyOwner {
+        if (amount == 0 || amount > _insuranceFundBalance) revert InsufficientInsuranceFund();
+        _insuranceFundBalance -= amount;
+        emit InsuranceFundWithdrawal(amount, _insuranceFundBalance);
+    }
+
+    // ==========================================================================
+    // INTERNAL HELPERS
+    // ==========================================================================
+
+    function _setLiquidationFee(uint256 feePercent) internal {
+        if (feePercent > BASIS_POINTS) revert InvalidLiquidationParameters();
+        _liquidationFeePercent = feePercent;
+    }
+
+    function _setLiquidatorReward(uint256 rewardPercent) internal {
+        if (rewardPercent > BASIS_POINTS) revert InvalidLiquidationParameters();
+        _liquidatorRewardPercent = rewardPercent;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

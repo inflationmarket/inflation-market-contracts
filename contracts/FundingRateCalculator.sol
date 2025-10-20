@@ -11,32 +11,29 @@ import "./interfaces/IIndexOracle.sol";
 
 /**
  * @title FundingRateCalculator
- * @notice Calculates funding rates based on market conditions
- * @dev Funding rates help keep perpetual futures prices anchored to spot
+ * @notice Calculates continuous funding between longs and shorts for Inflation Market.
  */
-contract FundingRateCalculator is
-    Initializable,
-    OwnableUpgradeable,
-    UUPSUpgradeable,
-    IFundingRateCalculator
-{
-    // ============================================================================
-    // STATE VARIABLES
-    // ============================================================================
+contract FundingRateCalculator is Initializable, OwnableUpgradeable, UUPSUpgradeable, IFundingRateCalculator {
+    uint256 private constant PRECISION = 1e18;
+    uint256 private constant APR_MULTIPLIER = 24 * 365;
 
     IvAMM public vamm;
     IIndexOracle public indexOracle;
+    address public positionManager;
 
-    int256 public lastFundingRate;
-    uint256 public lastUpdateTimestamp;
-    uint256 public fundingInterval; // Time between funding payments (e.g., 8 hours)
+    int256 private _currentFundingRate;
+    int256 private _longIndexAccumulator;
+    int256 private _shortIndexAccumulator;
 
-    uint256 public constant PRECISION = 1e18;
-    int256 public constant MAX_FUNDING_RATE = 0.001e18; // 0.1% per interval
+    uint256 private _lastFundingTime;
+    uint256 private _fundingInterval;
 
-    // ============================================================================
-    // INITIALIZATION
-    // ============================================================================
+    uint256 private _totalLongOpenInterest;
+    uint256 private _totalShortOpenInterest;
+
+    uint256 private _fundingRateCoefficient;
+    uint256 private _maxFundingRate; // positive cap (per interval)
+    uint256 private _minFundingRate; // positive magnitude for negative cap
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -44,113 +41,231 @@ contract FundingRateCalculator is
     }
 
     function initialize(
-        address _vamm,
-        address _indexOracle,
-        uint256 _fundingInterval
-    ) public initializer {
+        address vamm_,
+        address oracle_,
+        address positionManager_,
+        uint256 fundingInterval_,
+        uint256 coefficient_,
+        uint256 maxRate_,
+        uint256 minRate_
+    ) external initializer {
         __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
 
-        require(_vamm != address(0), "Invalid vAMM");
-        require(_indexOracle != address(0), "Invalid oracle");
+        require(vamm_ != address(0) && oracle_ != address(0), "invalid address");
+        require(fundingInterval_ > 0, "invalid interval");
 
-        vamm = IvAMM(_vamm);
-        indexOracle = IIndexOracle(_indexOracle);
-        fundingInterval = _fundingInterval;
-        lastUpdateTimestamp = block.timestamp;
+        vamm = IvAMM(vamm_);
+        indexOracle = IIndexOracle(oracle_);
+        positionManager = positionManager_;
+
+        _fundingInterval = fundingInterval_;
+        _fundingRateCoefficient = coefficient_ == 0 ? PRECISION : coefficient_;
+        _maxFundingRate = maxRate_ == 0 ? 5e14 : maxRate_; // default 0.05% per interval
+        _minFundingRate = minRate_ == 0 ? 5e14 : minRate_;
+
+        _lastFundingTime = block.timestamp;
     }
 
-    // ============================================================================
-    // CORE FUNCTIONS
-    // ============================================================================
+    // ==========================================================================
+    // MODIFIERS
+    // ==========================================================================
 
-    /**
-     * @notice Calculate current funding rate
-     * @return fundingRate Current funding rate (can be positive or negative)
-     */
-    function calculateFundingRate()
-        external
-        view
-        override
-        returns (int256 fundingRate)
-    {
-        // Get mark price from vAMM
-        uint256 markPrice = vamm.getPrice();
+    modifier onlyPositionManager() {
+        require(msg.sender == positionManager, "not position manager");
+        _;
+    }
 
-        // Get index price from oracle
-        (uint256 indexPrice, ) = indexOracle.getLatestIndex();
+    // ==========================================================================
+    // VIEW FUNCTIONS
+    // ==========================================================================
 
-        // Calculate premium = (markPrice - indexPrice) / indexPrice
-        int256 premium = (int256(markPrice) - int256(indexPrice)) * int256(PRECISION) / int256(indexPrice);
+    function currentFundingRate() external view override returns (int256) {
+        return _currentFundingRate;
+    }
 
-        // Funding rate = premium / interval
-        // Simplified: use premium directly with cap
-        fundingRate = premium;
+    function getFundingRateAPR() external view override returns (int256) {
+        return _currentFundingRate * int256(APR_MULTIPLIER);
+    }
 
-        // Cap funding rate
-        if (fundingRate > MAX_FUNDING_RATE) {
-            fundingRate = MAX_FUNDING_RATE;
-        } else if (fundingRate < -MAX_FUNDING_RATE) {
-            fundingRate = -MAX_FUNDING_RATE;
+    function longFundingIndex() public view override returns (int256) {
+        (int256 longIndex, ) = _previewIndices();
+        return longIndex;
+    }
+
+    function shortFundingIndex() public view override returns (int256) {
+        (, int256 shortIndex) = _previewIndices();
+        return shortIndex;
+    }
+
+    function lastFundingTime() external view override returns (uint256) {
+        return _lastFundingTime;
+    }
+
+    function fundingInterval() external view override returns (uint256) {
+        return _fundingInterval;
+    }
+
+    function totalLongOpenInterest() external view override returns (uint256) {
+        return _totalLongOpenInterest;
+    }
+
+    function totalShortOpenInterest() external view override returns (uint256) {
+        return _totalShortOpenInterest;
+    }
+
+    function fundingRateCoefficient() external view override returns (uint256) {
+        return _fundingRateCoefficient;
+    }
+
+    function maxFundingRate() external view override returns (uint256) {
+        return _maxFundingRate;
+    }
+
+    function minFundingRate() external view override returns (uint256) {
+        return _minFundingRate;
+    }
+
+    // ==========================================================================
+    // STATE-CHANGING FUNCTIONS
+    // ==========================================================================
+
+    function updateFundingRate(
+        uint256 markPrice,
+        uint256 indexPrice
+    ) external override onlyPositionManager {
+        if (indexPrice == 0) revert InvalidFundingParameters();
+
+        uint256 elapsed = block.timestamp - _lastFundingTime;
+        if (_lastFundingTime != 0 && elapsed < _fundingInterval) {
+            revert FundingUpdateTooSoon();
         }
 
-        return fundingRate;
+        if (_lastFundingTime != 0) {
+            _accrueFunding(elapsed);
+        }
+
+        int256 newRate = _computeFundingRate(markPrice, indexPrice);
+        _currentFundingRate = newRate;
+        _lastFundingTime = block.timestamp;
+
+        emit FundingRateUpdated(newRate, block.timestamp);
     }
 
-    /**
-     * @notice Update and store the funding rate
-     * @return fundingRate Updated funding rate
-     */
-    function updateFundingRate() external override returns (int256 fundingRate) {
-        require(
-            block.timestamp >= lastUpdateTimestamp + fundingInterval,
-            "Too early to update"
-        );
+    function calculateFundingPayment(
+        bool isLong,
+        uint256 size,
+        int256 entryFundingIndex
+    ) external view override returns (int256) {
+        (int256 longIndexPreview, int256 shortIndexPreview) = _previewIndices();
+        int256 currentIndex = isLong ? longIndexPreview : shortIndexPreview;
+        int256 indexDelta = currentIndex - entryFundingIndex;
 
-        fundingRate = this.calculateFundingRate();
-        lastFundingRate = fundingRate;
-        lastUpdateTimestamp = block.timestamp;
-
-        emit FundingRateUpdated(fundingRate, block.timestamp);
-        return fundingRate;
+        int256 payment = (int256(size) * indexDelta) / int256(PRECISION);
+        if (!isLong) {
+            payment = -payment;
+        }
+        return payment;
     }
 
-    /**
-     * @notice Get the last recorded funding rate
-     * @return Last funding rate
-     */
-    function getLastFundingRate() external view override returns (int256) {
-        return lastFundingRate;
+    function updateOpenInterest(
+        bool isLong,
+        uint256 sizeDelta,
+        bool isIncrease
+    ) external override onlyPositionManager {
+        if (sizeDelta == 0) return;
+
+        if (isLong) {
+            if (isIncrease) {
+                _totalLongOpenInterest += sizeDelta;
+            } else {
+                _totalLongOpenInterest = sizeDelta >= _totalLongOpenInterest
+                    ? 0
+                    : _totalLongOpenInterest - sizeDelta;
+            }
+        } else {
+            if (isIncrease) {
+                _totalShortOpenInterest += sizeDelta;
+            } else {
+                _totalShortOpenInterest = sizeDelta >= _totalShortOpenInterest
+                    ? 0
+                    : _totalShortOpenInterest - sizeDelta;
+            }
+        }
+
+        emit OpenInterestUpdated(_totalLongOpenInterest, _totalShortOpenInterest);
     }
 
-    /**
-     * @notice Get timestamp of last funding rate update
-     * @return Timestamp
-     */
-    function getLastUpdateTimestamp() external view override returns (uint256) {
-        return lastUpdateTimestamp;
+    function setFundingRateCoefficient(uint256 coefficient) external override onlyOwner {
+        if (coefficient == 0) revert InvalidFundingParameters();
+        _fundingRateCoefficient = coefficient;
+        emit FundingParametersUpdated(coefficient, _maxFundingRate, _minFundingRate);
     }
 
-    /**
-     * @notice Get funding interval duration
-     * @return Funding interval in seconds
-     */
-    function getFundingInterval() external view override returns (uint256) {
-        return fundingInterval;
+    function setMaxFundingRate(uint256 maxRate) external override onlyOwner {
+        if (maxRate == 0) revert InvalidFundingParameters();
+        _maxFundingRate = maxRate;
+        emit FundingParametersUpdated(_fundingRateCoefficient, maxRate, _minFundingRate);
     }
 
-    // ============================================================================
-    // ADMIN FUNCTIONS
-    // ============================================================================
-
-    function setFundingInterval(uint256 _fundingInterval) external onlyOwner {
-        require(_fundingInterval > 0, "Invalid interval");
-        fundingInterval = _fundingInterval;
+    function setMinFundingRate(uint256 minRate) external override onlyOwner {
+        if (minRate == 0) revert InvalidFundingParameters();
+        _minFundingRate = minRate;
+        emit FundingParametersUpdated(_fundingRateCoefficient, _maxFundingRate, minRate);
     }
 
-    function _authorizeUpgrade(address newImplementation)
-        internal
-        override
-        onlyOwner
-    {}
+    function setFundingInterval(uint256 interval) external override onlyOwner {
+        if (interval == 0) revert InvalidFundingParameters();
+        _fundingInterval = interval;
+        emit FundingParametersUpdated(_fundingRateCoefficient, _maxFundingRate, _minFundingRate);
+    }
+
+    function setPositionManager(address positionManager_) external onlyOwner {
+        positionManager = positionManager_;
+    }
+
+    // ==========================================================================
+    // INTERNAL HELPERS
+    // ==========================================================================
+
+    function _accrueFunding(uint256 elapsed) internal {
+        if (elapsed == 0 || _fundingInterval == 0) return;
+        int256 delta = (_currentFundingRate * int256(elapsed)) / int256(_fundingInterval);
+        _longIndexAccumulator += delta;
+        _shortIndexAccumulator -= delta;
+    }
+
+    function _previewIndices() internal view returns (int256 longIndex, int256 shortIndex) {
+        longIndex = _longIndexAccumulator;
+        shortIndex = _shortIndexAccumulator;
+
+        if (_fundingInterval == 0 || _lastFundingTime == 0) {
+            return (longIndex, shortIndex);
+        }
+
+        uint256 elapsed = block.timestamp - _lastFundingTime;
+        if (elapsed == 0) return (longIndex, shortIndex);
+
+        int256 delta = (_currentFundingRate * int256(elapsed)) / int256(_fundingInterval);
+        longIndex += delta;
+        shortIndex -= delta;
+    }
+
+    function _computeFundingRate(uint256 markPrice, uint256 indexPrice) internal view returns (int256) {
+        if (indexPrice == 0) revert InvalidFundingParameters();
+
+        int256 mark = int256(markPrice);
+        int256 index = int256(indexPrice);
+        int256 premium = ((mark - index) * int256(_fundingRateCoefficient)) / int256(indexPrice);
+
+        if (premium > int256(_maxFundingRate)) {
+            premium = int256(_maxFundingRate);
+        } else if (premium < -int256(_minFundingRate)) {
+            premium = -int256(_minFundingRate);
+        }
+
+        return premium;
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

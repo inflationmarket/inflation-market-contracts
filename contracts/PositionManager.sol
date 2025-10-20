@@ -58,8 +58,8 @@ contract PositionManager is
         uint128 leverage;            // Leverage multiplier (1e18 = 1x, max 20e18 fits in uint128)
         uint128 entryPrice;          // Entry price (1e18 precision, max price ~3.4e20 = $340 trillion)
 
-        // SLOT 3: uint128 + uint128 = 32 bytes
-        uint128 entryFundingIndex;   // Funding index at entry
+        // SLOT 3: int128 + uint128 = 32 bytes
+        int128 entryFundingIndex;    // Signed funding index at entry
         uint128 liquidationPrice;    // Calculated liquidation price
 
         // SLOT 4: bool (1 byte) + 31 bytes unused
@@ -183,6 +183,7 @@ contract PositionManager is
     error SlippageExceeded(); // FIX #2
     error InvalidMaintenanceMargin(); // FIX #10
     error SwapFailed(bytes data); // FIX #13
+    error FundingIndexOverflow();
 
     // ============================================================================
     // INITIALIZATION
@@ -334,7 +335,7 @@ contract PositionManager is
         // Get current market price from virtual AMM
         // This is the price at which the position will be opened
         // Price has 1e18 precision (e.g., 2000e18 = $2000)
-        uint256 entryPrice = vamm.getPrice();
+        uint256 entryPrice = vamm.getMarkPrice();
 
         // ========================================================================
         // STEP 3.5: SLIPPAGE PROTECTION (FIX #2)
@@ -395,19 +396,8 @@ contract PositionManager is
         // Long = buy pressure (increases mark price)
         // Short = sell pressure (decreases mark price)
         //
-        // Note: vAMM.swap() updates the constant product (k = x * y)
-        // and moves the mark price based on the position size
-        try vamm.swap(size, isLong) returns (uint256) {
-            // Swap successful - vAMM reserves updated
-            // The return value represents the amount received from the swap
-            // We don't need it here as we're using the pre-swap price as entry price
-        } catch Error(string memory reason) {
-            // FIX #13: Better error messages - include reason from vAMM
-            revert(string(abi.encodePacked("vAMM swap failed: ", reason)));
-        } catch (bytes memory lowLevelData) {
-            // FIX #13: Handle low-level failures with custom error
-            revert SwapFailed(lowLevelData);
-        }
+        // Note: updateReserves adjusts the virtual pool balances to reflect the trade.
+        _executeVammTrade(isLong ? int256(size) : -int256(size));
 
         // ========================================================================
         // STEP 8: GET CURRENT FUNDING INDEX
@@ -417,7 +407,10 @@ contract PositionManager is
         // This is stored to calculate funding payments when position is closed
         // Funding payments occur periodically between longs and shorts to keep
         // perpetual price anchored to index price
-        uint256 entryFundingIndex = _getCurrentFundingIndex();
+        int256 entryFundingIndex = _getCurrentFundingIndex(isLong);
+        if (entryFundingIndex > type(int128).max || entryFundingIndex < type(int128).min) {
+            revert FundingIndexOverflow();
+        }
 
         // ========================================================================
         // STEP 9: CALCULATE LIQUIDATION PRICE
@@ -451,10 +444,13 @@ contract PositionManager is
             collateral: uint128(collateralAmount),     // Locked collateral amount
             leverage: uint128(leverage),               // Leverage multiplier (max 20e18 fits in uint128)
             entryPrice: uint128(entryPrice),           // Price at position open
-            entryFundingIndex: uint128(entryFundingIndex), // Funding index at entry
+            entryFundingIndex: int128(entryFundingIndex),  // Funding index at entry
             liquidationPrice: uint128(liquidationPrice),   // Pre-calculated liq price
             isLong: isLong                             // Direction (long/short)
         });
+
+        // Update funding open interest tracking
+        fundingCalculator.updateOpenInterest(isLong, size, true);
 
         // ========================================================================
         // STEP 11: UPDATE USER POSITION TRACKING
@@ -489,14 +485,6 @@ contract PositionManager is
         // ========================================================================
         // STEP 12: UPDATE OPEN INTEREST (For Funding Rate Calculation)
         // ========================================================================
-
-        // Update the FundingRateCalculator with new open interest
-        // This is used to calculate funding rates based on long/short imbalance
-        //
-        // Note: This is a placeholder - actual implementation depends on
-        // FundingRateCalculator interface. Typically you would call:
-        // fundingCalculator.updateOpenInterest(size, isLong, true);
-        //
         // Where parameters are: (size, isLong, isIncrease)
         // This allows the funding rate to adjust based on market imbalance
 
@@ -610,7 +598,7 @@ contract PositionManager is
         // Retrieve current market price from vAMM
         // This is the exit price at which position will be closed
         // Price has 1e18 precision (e.g., 2100e18 = $2100)
-        uint256 currentPrice = vamm.getPrice();
+        uint256 currentPrice = vamm.getMarkPrice();
 
         // ========================================================================
         // STEP 3: CALCULATE UNREALIZED P&L
@@ -644,14 +632,7 @@ contract PositionManager is
         // - Short position closing = buy (increases mark price)
         //
         // The reverse swap reduces open interest and helps price discovery
-        try vamm.swap(posSize, !posIsLong) returns (uint256) {  // Use cached values
-            // Reverse swap successful - vAMM reserves updated
-            // Long closes by selling, short closes by buying
-        } catch {
-            // If vAMM swap fails, position closing fails
-            // This protects protocol from inconsistent state
-            revert("vAMM reverse swap failed");
-        }
+        _executeVammTrade(posIsLong ? -int256(posSize) : int256(posSize));
 
         // ========================================================================
         // STEP 5: CALCULATE CLOSING FEE
@@ -774,12 +755,7 @@ contract PositionManager is
         // STEP 9: UPDATE OPEN INTEREST
         // ========================================================================
 
-        // Update FundingRateCalculator to decrease open interest
-        // This affects funding rate calculations for remaining positions
-        //
-        // Note: Placeholder - actual implementation depends on interface
-        // Typically: fundingCalculator.updateOpenInterest(position.size, position.isLong, false);
-        // Where false indicates decrease in open interest
+        fundingCalculator.updateOpenInterest(posIsLong, posSize, false);
 
         // ========================================================================
         // STEP 10: REMOVE FROM USER TRACKING
@@ -848,7 +824,7 @@ contract PositionManager is
         pnls = new int256[](length);
 
         // Cache current price to save gas on multiple calls (shared across all positions)
-        uint256 currentPrice = vamm.getPrice();
+        uint256 currentPrice = vamm.getMarkPrice();
 
         // Process each position
         for (uint256 i = 0; i < length;) {
@@ -869,11 +845,7 @@ contract PositionManager is
             pnls[i] = pnl;
 
             // Execute vAMM reverse swap
-            try vamm.swap(posSize, !posIsLong) {
-                // Swap successful
-            } catch {
-                revert("vAMM reverse swap failed");
-            }
+            _executeVammTrade(posIsLong ? -int256(posSize) : int256(posSize));
 
             // Calculate closing fee
             uint256 closingFee = (posSize * tradingFee) / BASIS_POINTS;
@@ -926,6 +898,8 @@ contract PositionManager is
                     vault.writeOffCollateral(msg.sender, residual);
                 }
             }
+
+            fundingCalculator.updateOpenInterest(posIsLong, posSize, false);
 
             // Remove from user tracking
             _removeUserPosition(msg.sender, positionId);
@@ -1128,7 +1102,7 @@ contract PositionManager is
         // Retrieve current market price from vAMM
         // This is the price at which the position is being liquidated
         // Used for event emission and analytics
-        uint256 currentPrice = vamm.getPrice();
+        uint256 currentPrice = vamm.getMarkPrice();
 
         // ========================================================================
         // STEP 5: EXECUTE REVERSE SWAP ON vAMM
@@ -1138,14 +1112,8 @@ contract PositionManager is
         // Similar to closing a position, but liquidation doesn't return funds to trader
         // Long position = sell (decreases mark price)
         // Short position = buy (increases mark price)
-        try vamm.swap(position.size, !position.isLong) returns (uint256) {
-            // Reverse swap successful - vAMM reserves updated
-            // Position is now closed on the vAMM side
-        } catch {
-            // If vAMM swap fails, liquidation fails
-            // This maintains protocol consistency
-            revert("vAMM reverse swap failed during liquidation");
-        }
+        int256 liquidateSize = int256(uint256(position.size));
+        _executeVammTrade(position.isLong ? -liquidateSize : liquidateSize);
 
         // ========================================================================
         // STEP 6: CALCULATE LIQUIDATOR REWARD
@@ -1203,10 +1171,7 @@ contract PositionManager is
 
         // Update FundingRateCalculator to decrease open interest
         // This affects funding rate calculations for remaining positions
-        //
-        // Note: Placeholder - actual implementation depends on interface
-        // Typically: fundingCalculator.updateOpenInterest(position.size, position.isLong, false);
-        // Where false indicates decrease in open interest
+        fundingCalculator.updateOpenInterest(position.isLong, position.size, false);
 
         // ========================================================================
         // STEP 10: REMOVE FROM USER TRACKING
@@ -1426,7 +1391,7 @@ contract PositionManager is
         // Retrieve the current market price from vAMM
         // This is constantly changing as traders open/close positions
         // Price uses 1e18 precision (e.g., 2100e18 = $2100)
-        uint256 currentPrice = vamm.getPrice();
+        uint256 currentPrice = vamm.getMarkPrice();
 
         // ====================================================================
         // STEP 2: CALCULATE PRICE DELTA
@@ -1565,7 +1530,7 @@ contract PositionManager is
         // Retrieve the current cumulative funding index
         // This is a continuously growing value that tracks all funding payments
         // over time, similar to how interest compounds
-        uint256 currentIndex = _getCurrentFundingIndex();
+        int256 currentIndex = _getCurrentFundingIndex(position.isLong);
 
         // ====================================================================
         // STEP 2: CALCULATE INDEX DELTA
@@ -1573,36 +1538,15 @@ contract PositionManager is
 
         // Calculate how much the funding index has changed since position entry
         // This represents the cumulative funding rate accrued during position lifetime
-        //
-        // Example:
-        // - Entry funding index: 1000
-        // - Current funding index: 1050
-        // - Index delta: 50 (represents 5% cumulative funding)
-        uint256 indexDelta;
-        if (currentIndex > position.entryFundingIndex) {
-            unchecked {
-                // GAS OPTIMIZATION: Safe subtraction - we've verified currentIndex > entryFundingIndex
-                indexDelta = currentIndex - position.entryFundingIndex;
-            }
-        } else {
-            indexDelta = 0; // Safety check: if current < entry, no payment
-        }
+        int256 indexDelta = currentIndex - int256(position.entryFundingIndex);
 
         // ====================================================================
         // STEP 3: CALCULATE FUNDING PAYMENT AMOUNT
         // ====================================================================
 
         // Apply index delta to position size to get absolute payment amount
-        //
-        // Formula: payment = position size * (funding rate change)
-        //
-        // Example:
-        // - Position size: 5000 USDC
-        // - Index delta: 50 (from step 2)
-        // - Payment = 5000 * 50 / 1e18 = calculated payment in USDC
-        //
-        // Larger positions pay/receive proportionally more funding
-        payment = int256((position.size * indexDelta) / PRECISION);
+        int256 signedSize = int256(uint256(position.size));
+        payment = (signedSize * indexDelta) / int256(PRECISION);
 
         // ====================================================================
         // STEP 4: ADJUST FOR POSITION DIRECTION
@@ -1617,13 +1561,13 @@ contract PositionManager is
         // - When funding is positive (mark > index): shorts RECEIVE
         // - Payment should be negative (increases P&L)
         // - Invert payment (multiply by -1)
-        if (!position.isLong) {
-            payment = -payment;
-        }
+    if (!position.isLong) {
+        payment = -payment;
+    }
 
-        // ====================================================================
-        // STEP 5: RETURN FUNDING PAYMENT
-        // ====================================================================
+    // ====================================================================
+    // STEP 5: RETURN FUNDING PAYMENT
+    // ====================================================================
 
         // Return the calculated funding payment
         // Positive value = trader owes payment (reduces final P&L)
@@ -1636,9 +1580,22 @@ contract PositionManager is
     /**
      * @dev Get current funding index from funding calculator
      */
-    function _getCurrentFundingIndex() internal view returns (uint256) {
-        // This is simplified - actual implementation would integrate with funding calculator
-        return uint256(fundingCalculator.getLastFundingRate());
+    function _getCurrentFundingIndex(bool isLong) internal view returns (int256) {
+        return isLong ? fundingCalculator.longFundingIndex() : fundingCalculator.shortFundingIndex();
+    }
+
+    function _executeVammTrade(int256 sizeDelta) internal {
+        if (sizeDelta == 0) {
+            return;
+        }
+
+        try vamm.updateReserves(sizeDelta) {
+            // Trade executed successfully
+        } catch Error(string memory reason) {
+            revert(string(abi.encodePacked("vAMM trade failed: ", reason)));
+        } catch (bytes memory lowLevelData) {
+            revert SwapFailed(lowLevelData);
+        }
     }
 
     /**
