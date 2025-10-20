@@ -29,6 +29,11 @@ describe("PositionManager", function () {
   const INITIAL_PRICE = ethers.parseEther("2000"); // $2000
   const MIN_COLLATERAL = ethers.parseUnits("10", 6); // 10 USDC (6 decimals)
   const DEFAULT_COLLATERAL = ethers.parseUnits("1000", 6); // 1000 USDC
+
+  // Slippage protection parameters (for security fix #2)
+  const NO_MIN_PRICE = 0;
+  const NO_MAX_PRICE = ethers.MaxUint256;
+
   const DEFAULT_MAINTENANCE_MARGIN = 500n; // 5%
   const DEFAULT_TRADING_FEE = 10n; // 0.1%
   const DEFAULT_LIQUIDATION_FEE = 500n; // 5%
@@ -221,7 +226,9 @@ describe("PositionManager", function () {
         true, // isLong
         collateral,
         leverage
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       await expect(tx).to.emit(positionManager, "PositionOpened");
 
@@ -243,7 +250,9 @@ describe("PositionManager", function () {
         false, // isShort
         collateral,
         leverage
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       await expect(tx).to.emit(positionManager, "PositionOpened");
       expect(await positionManager.totalPositions()).to.equal(1);
@@ -256,7 +265,9 @@ describe("PositionManager", function () {
       const leverage = ethers.parseEther("5"); // 5x
       const expectedSize = (collateral * leverage) / PRECISION;
 
-      const tx = await positionManager.connect(trader1).openPosition(true, collateral, leverage);
+      const tx = await positionManager.connect(trader1).openPosition(true, collateral, leverage,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       const receipt = await tx.wait();
 
       const userPositions = await positionManager.getUserPositions(trader1.address);
@@ -273,7 +284,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           MIN_LEVERAGE
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
     });
 
@@ -285,7 +298,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           DEFAULT_MAX_LEVERAGE
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
     });
 
@@ -305,7 +320,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           MAX_LEVERAGE_CAP
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
     });
 
@@ -317,7 +334,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           0
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "InvalidLeverage");
     });
 
@@ -331,7 +350,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           tooHighLeverage
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "InvalidLeverage");
     });
 
@@ -345,7 +366,9 @@ describe("PositionManager", function () {
           true,
           tooLowCollateral,
           ethers.parseEther("5")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "InsufficientCollateral");
     });
 
@@ -359,7 +382,9 @@ describe("PositionManager", function () {
         true,
         collateral,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const finalLocked = await vault.lockedCollateral(trader1.address);
 
@@ -375,7 +400,9 @@ describe("PositionManager", function () {
       const leverage = ethers.parseEther("5");
 
       await expect(
-        positionManager.connect(trader1).openPosition(true, collateral, leverage)
+        positionManager.connect(trader1).openPosition(true, collateral, leverage,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       )
         .to.emit(positionManager, "PositionOpened")
         .withArgs(
@@ -397,13 +424,17 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       await positionManager.connect(trader1).openPosition(
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       expect(positions[0]).to.not.equal(positions[1]);
@@ -419,7 +450,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           ethers.parseEther("5")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "EnforcedPause");
     });
   });
@@ -438,7 +471,9 @@ describe("PositionManager", function () {
         true, // long
         DEFAULT_COLLATERAL,
         ethers.parseEther("5") // 5x
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const positionId = positions[0];
@@ -526,12 +561,16 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       await positionManager.connect(trader1).openPosition(
         false,
         DEFAULT_COLLATERAL,
         ethers.parseEther("3")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       let positions = await positionManager.getUserPositions(trader1.address);
       expect(positions.length).to.equal(2);
@@ -557,7 +596,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const positionId = positions[0];
@@ -609,7 +650,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const positionId = positions[0];
@@ -721,7 +764,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("1") // Minimum leverage (1x)
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const isLiquidatable = await positionManager.isPositionLiquidatable(positions[0]);
@@ -746,7 +791,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
 
@@ -764,7 +811,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("1") // Minimum leverage (1x)
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const isLiquidatable = await positionManager.isPositionLiquidatable(positions[0]);
@@ -796,7 +845,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       // Verify position exists
       let positions = await positionManager.getUserPositions(trader1.address);
@@ -826,17 +877,23 @@ describe("PositionManager", function () {
         true,
         ethers.parseUnits("500", 6),
         ethers.parseEther("3")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       await positionManager.connect(trader1).openPosition(
         false,
         ethers.parseUnits("800", 6),
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       await positionManager.connect(trader1).openPosition(
         true,
         ethers.parseUnits("1000", 6),
         ethers.parseEther("2")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       expect(positions.length).to.equal(3);
@@ -850,12 +907,16 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       await positionManager.connect(trader2).openPosition(
         false,
         DEFAULT_COLLATERAL,
         ethers.parseEther("3")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const trader1Positions = await positionManager.getUserPositions(trader1.address);
       const trader2Positions = await positionManager.getUserPositions(trader2.address);
@@ -894,7 +955,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           ethers.parseEther("5")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "EnforcedPause");
 
       // Unpause
@@ -907,7 +970,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           ethers.parseEther("5")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
     });
 
@@ -980,7 +1045,9 @@ describe("PositionManager", function () {
           true,
           MIN_COLLATERAL, // Exactly 10 USDC
           ethers.parseEther("1")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
 
       // Just below minimum should fail
@@ -989,7 +1056,9 @@ describe("PositionManager", function () {
           true,
           MIN_COLLATERAL - 1n,
           ethers.parseEther("1")
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "InsufficientCollateral");
     });
 
@@ -1010,7 +1079,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           MAX_LEVERAGE_CAP
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
 
       // Above max should fail
@@ -1019,7 +1090,9 @@ describe("PositionManager", function () {
           true,
           DEFAULT_COLLATERAL,
           MAX_LEVERAGE_CAP + 1n
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.be.revertedWithCustomError(positionManager, "InvalidLeverage");
     });
 
@@ -1030,7 +1103,9 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const positionId = positions[0];
@@ -1054,7 +1129,9 @@ describe("PositionManager", function () {
           true,
           ethers.parseUnits("5000", 6), // 5k USDC collateral (10% of balance)
           ethers.parseEther("1") // 1x leverage - minimum
-        )
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE)
       ).to.not.be.reverted;
     });
 
@@ -1066,7 +1143,9 @@ describe("PositionManager", function () {
           true,
           ethers.parseUnits("200", 6),
           ethers.parseEther("2")
-        );
+        ,
+          NO_MIN_PRICE,
+          NO_MAX_PRICE);
 
         const positions = await positionManager.getUserPositions(trader1.address);
         await positionManager.connect(trader1).closePosition(positions[positions.length - 1]);
@@ -1093,7 +1172,9 @@ describe("PositionManager", function () {
         true,
         ethers.parseUnits("1000", 6), // Should work with remaining balance
         ethers.parseEther("1")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       // If it succeeded, verify the position was created
       expect(result).to.not.be.null;
@@ -1111,7 +1192,9 @@ describe("PositionManager", function () {
       const collateral = DEFAULT_COLLATERAL;
       const leverage = ethers.parseEther("5");
 
-      await positionManager.connect(trader1).openPosition(true, collateral, leverage);
+      await positionManager.connect(trader1).openPosition(true, collateral, leverage,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
 
       const positions = await positionManager.getUserPositions(trader1.address);
       const position = await positionManager.getPosition(positions[0]);
@@ -1138,14 +1221,18 @@ describe("PositionManager", function () {
         true,
         DEFAULT_COLLATERAL,
         ethers.parseEther("5")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       expect(await positionManager.totalPositions()).to.equal(1);
 
       await positionManager.connect(trader2).openPosition(
         false,
         DEFAULT_COLLATERAL,
         ethers.parseEther("3")
-      );
+      ,
+        NO_MIN_PRICE,
+        NO_MAX_PRICE);
       expect(await positionManager.totalPositions()).to.equal(2);
     });
   });
